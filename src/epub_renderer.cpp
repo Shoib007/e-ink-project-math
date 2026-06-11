@@ -1,6 +1,5 @@
 #include "epub_renderer.h"
 #include <string.h>
-#include <esp_heap_caps.h>
 
 EpubRenderer* EpubRenderer::s_instance = nullptr;
 
@@ -24,7 +23,7 @@ static int32_t pngSeek(PNGFILE* /*h*/, int32_t pos) {
 }
 
 // -----------------------------------------------------------------------
-// PNG decode — writes directly into framebuffer (NOT display)
+// PNG row callback — writes decoded pixels into active page buffer
 // -----------------------------------------------------------------------
 int EpubRenderer::s_pngDraw(PNGDRAW* pDraw) {
   if (s_instance) s_instance->pngRowDraw(pDraw);
@@ -43,11 +42,13 @@ void EpubRenderer::pngRowDraw(PNGDRAW* pDraw) {
     uint8_t g8 = ((p >>  5) & 0x3F) << 2;
     uint8_t b8 = ( p        & 0x1F) << 3;
     uint16_t luma = (r8 * 299 + g8 * 587 + b8 * 114) / 1000;
-    // Write into framebuffer: 0=black, 1=white
-    g_fb.drawPixel(px, py, luma < 180 ? 0 : 1);
+    g_pool.drawPixel(px, py, luma < 180 ? 0 : 1);
   }
 }
 
+// -----------------------------------------------------------------------
+// PNG size probe — open header only, no pixel decode
+// -----------------------------------------------------------------------
 bool EpubRenderer::pngGetSize(const char* path, uint16_t& w, uint16_t& h) {
   s_instance = this;
   int rc = _png.open(path, pngOpen, pngClose, pngRead, pngSeek, s_pngDraw);
@@ -57,7 +58,10 @@ bool EpubRenderer::pngGetSize(const char* path, uint16_t& w, uint16_t& h) {
   return true;
 }
 
-bool EpubRenderer::decodePngToFb(const char* path, int16_t destX, int16_t destY) {
+// -----------------------------------------------------------------------
+// Decode PNG directly into active page buffer in pool
+// -----------------------------------------------------------------------
+bool EpubRenderer::decodePngToPool(const char* path, int16_t destX, int16_t destY) {
   s_instance = this;
   _imgDestX = destX; _imgDestY = destY;
   int rc = _png.open(path, pngOpen, pngClose, pngRead, pngSeek, s_pngDraw);
@@ -68,7 +72,7 @@ bool EpubRenderer::decodePngToFb(const char* path, int16_t destX, int16_t destY)
 }
 
 // -----------------------------------------------------------------------
-// Font selection — on the FbCanvas, not the display
+// Font selection — on FbCanvas (routes to page pool via drawPixel)
 // -----------------------------------------------------------------------
 void EpubRenderer::selectFont(FontLevel level) {
   switch (level) {
@@ -80,20 +84,15 @@ void EpubRenderer::selectFont(FontLevel level) {
 }
 
 // -----------------------------------------------------------------------
-// PSRAM allocation
+// Page management
 // -----------------------------------------------------------------------
 bool EpubRenderer::beginDoc() {
-  if (!_pool) {
-    _pool = (DrawCmd*)heap_caps_malloc(
-        TOTAL_CMDS * sizeof(DrawCmd), MALLOC_CAP_SPIRAM);
-    if (!_pool) {
-      Serial.printf("ERROR: PSRAM pool alloc failed\n");
-      return false;
-    }
-  }
-  _poolUsed   = 0;
-  _pageCount  = 1;
-  _pageInfo[0] = {0, 0};
+  // Allocate and activate page 0
+  int idx = g_pool.allocPage();
+  if (idx < 0) { Serial.println("ERROR: pool alloc failed for page 0"); return false; }
+  g_pool.setCurrent(idx);
+  g_pool.clearCurrent();
+
   _cx = MARGIN_LEFT; _cy = MARGIN_TOP;
   _lineH = 0; _lineHasContent = false;
   return true;
@@ -101,27 +100,23 @@ bool EpubRenderer::beginDoc() {
 
 void EpubRenderer::endDoc() {
   if (_lineHasContent) newLine();
-}
-
-// -----------------------------------------------------------------------
-// Command pool
-// -----------------------------------------------------------------------
-void EpubRenderer::addCmd(const DrawCmd& cmd) {
-  if (_poolUsed >= TOTAL_CMDS) { Serial.println("WARN: cmd pool full"); return; }
-  _pool[_poolUsed++] = cmd;
-  _pageInfo[_pageCount - 1].count++;
+  // Current page buffer is already fully rendered — nothing to flush
+  Serial.printf("Pre-render complete. %d pages in PSRAM.\n", g_pool.pageCount());
 }
 
 void EpubRenderer::breakPage() {
-  if (_pageCount >= MAX_PAGES) { Serial.println("WARN: max pages"); return; }
-  _pageInfo[_pageCount] = { _poolUsed, 0 };
-  _pageCount++;
+  // Allocate a new page buffer and make it the render target
+  int idx = g_pool.allocPage();
+  if (idx < 0) { Serial.println("WARN: max pages reached"); return; }
+  g_pool.setCurrent(idx);
+  g_pool.clearCurrent();
+
   _cx = MARGIN_LEFT; _cy = MARGIN_TOP;
   _lineH = 0; _lineHasContent = false;
 }
 
 // -----------------------------------------------------------------------
-// Line layout
+// Line management
 // -----------------------------------------------------------------------
 void EpubRenderer::newLine(int16_t extraSpacing) {
   _cy += (_lineH > 0 ? _lineH : 14) + LINE_SPACING + extraSpacing;
@@ -133,9 +128,9 @@ void EpubRenderer::checkPageOverflow(int16_t neededH) {
 }
 
 // -----------------------------------------------------------------------
-// Layout: word
+// Render: word (text into current page buffer via FbCanvas)
 // -----------------------------------------------------------------------
-void EpubRenderer::layoutWord(const char* word, FontLevel level) {
+void EpubRenderer::renderWord(const char* word, FontLevel level) {
   if (!word || !word[0]) return;
   selectFont(level);
   _canvas.setTextWrap(false);
@@ -150,20 +145,18 @@ void EpubRenderer::layoutWord(const char* word, FontLevel level) {
   if ((int16_t)th > _lineH) _lineH = (int16_t)th;
   checkPageOverflow(th);
 
-  DrawCmd cmd; memset(&cmd, 0, sizeof(cmd));
-  cmd.type = DC_TEXT; cmd.fontLevel = level;
-  cmd.x = _cx; cmd.y = _cy + (-y1);
-  strncpy(cmd.text, word, MAX_TEXT_LEN - 1);
-  addCmd(cmd);
+  _canvas.setTextColor(0);  // 0 = black
+  _canvas.setCursor(_cx, _cy + (-y1));
+  _canvas.print(word);
 
   _cx += (int16_t)tw;
   _lineHasContent = true;
 }
 
 // -----------------------------------------------------------------------
-// Layout: inline image
+// Render: inline image (decode PNG into current page buffer)
 // -----------------------------------------------------------------------
-void EpubRenderer::layoutInlineImage(const char* path) {
+void EpubRenderer::renderInlineImage(const char* path) {
   uint16_t imgW, imgH;
   if (!pngGetSize(path, imgW, imgH)) return;
 
@@ -171,13 +164,11 @@ void EpubRenderer::layoutInlineImage(const char* path) {
     newLine();
   checkPageOverflow(imgH);
 
-  DrawCmd cmd; memset(&cmd, 0, sizeof(cmd));
-  cmd.type = DC_IMAGE;
-  cmd.x = _cx;
-  cmd.y = _cy - (int16_t)(imgH / 2);
-  if (cmd.y < 0) cmd.y = 0;
-  strncpy(cmd.path, path, MAX_PATH_LEN - 1);
-  addCmd(cmd);
+  int16_t destX = _cx;
+  int16_t destY = _cy - (int16_t)(imgH / 2);
+  if (destY < 0) destY = 0;
+
+  decodePngToPool(path, destX, destY);
 
   if ((int16_t)imgH > _lineH) _lineH = (int16_t)imgH;
   _cx += (int16_t)imgW + 2;
@@ -185,34 +176,30 @@ void EpubRenderer::layoutInlineImage(const char* path) {
 }
 
 // -----------------------------------------------------------------------
-// Layout: block image
+// Render: block image (centered, own line)
 // -----------------------------------------------------------------------
-void EpubRenderer::layoutBlockImage(const char* path) {
+void EpubRenderer::renderBlockImage(const char* path) {
   if (_lineHasContent) newLine();
   uint16_t imgW, imgH;
   if (!pngGetSize(path, imgW, imgH)) return;
   checkPageOverflow(imgH + LINE_SPACING * 2);
 
-  DrawCmd cmd; memset(&cmd, 0, sizeof(cmd));
-  cmd.type = DC_IMAGE;
-  cmd.x = (DISPLAY_W - (int16_t)imgW) / 2;
-  cmd.y = _cy;
-  strncpy(cmd.path, path, MAX_PATH_LEN - 1);
-  addCmd(cmd);
+  int16_t destX = (DISPLAY_W - (int16_t)imgW) / 2;
+  decodePngToPool(path, destX, _cy);
 
   _cy += (int16_t)imgH + LINE_SPACING * 2;
   _cx = MARGIN_LEFT; _lineH = 0; _lineHasContent = false;
 }
 
 // -----------------------------------------------------------------------
-// Feed
+// Feed — called by parser during setup, renders directly into page buffers
 // -----------------------------------------------------------------------
 void EpubRenderer::feed(const RenderElem& elem) {
   switch (elem.type) {
     case ELEM_TEXT:
-    case ELEM_HEADING:      layoutWord(elem.text, elem.fontLevel); break;
-    case ELEM_IMAGE_INLINE: layoutInlineImage(elem.path);          break;
-    case ELEM_IMAGE_BLOCK:  layoutBlockImage(elem.path);           break;
+    case ELEM_HEADING:      renderWord(elem.text, elem.fontLevel); break;
+    case ELEM_IMAGE_INLINE: renderInlineImage(elem.path);          break;
+    case ELEM_IMAGE_BLOCK:  renderBlockImage(elem.path);           break;
     case ELEM_PARA_BREAK:
       if (_lineHasContent) newLine();
       newLine(PARA_SPACING);
@@ -225,46 +212,20 @@ void EpubRenderer::feed(const RenderElem& elem) {
 }
 
 // -----------------------------------------------------------------------
-// showPage — render everything into PSRAM framebuffer, then copy into
-// GxEPD2's internal buffer via its firstPage/nextPage loop.
-// Result: ONE full e-ink refresh cycle regardless of content complexity.
+// showPage — copy pre-rendered PSRAM buffer into GxEPD2, one refresh.
+// No SD access. No PNG decode. No font rendering. Just a memory copy.
+// Total time = copy loop (~100ms) + e-ink waveform (~1.5-2s).
 // -----------------------------------------------------------------------
 void EpubRenderer::showPage(int index) {
-  if (!_pool || index < 0 || index >= _pageCount) return;
-  const PageInfo& pi = _pageInfo[index];
+  const uint8_t* fb = g_pool.pageBuf(index);
+  if (!fb) return;
 
-  // ---- Step 1: render all commands into PSRAM framebuffer ----
-  // No display I/O at all during this step.
-  g_fb.clear();
-  _canvas.setTextColor(0);  // 0 = black
-  for (int i = 0; i < pi.count; i++) {
-    const DrawCmd& cmd = _pool[pi.start + i];
-    if (cmd.type == DC_TEXT) {
-      selectFont(cmd.fontLevel);
-      _canvas.setTextColor(0);
-      _canvas.setCursor(cmd.x, cmd.y);
-      _canvas.print(cmd.text);
-    } else {
-      decodePngToFb(cmd.path, cmd.x, cmd.y);
-    }
-  }
-
-  // ---- Step 2: copy PSRAM framebuffer into GxEPD2's paged buffer ----
-  // The firstPage/nextPage loop runs twice (400px per pass).
-  // Each pass: copy only the rows that belong to the current half-page
-  // from our framebuffer into GxEPD2 via drawPixel().
-  // This is a simple memory copy dressed as drawPixel calls — fast.
   _disp.setFullWindow();
   _disp.firstPage();
   do {
-    // GxEPD2 tracks which page (half) is current internally.
-    // We fill its buffer by calling drawPixel for every pixel.
-    // Since drawPixel clips to the current page window automatically,
-    // we can safely iterate the full display height — out-of-range
-    // rows are discarded by GxEPD2 with no overhead.
-    const uint8_t* fb = g_fb.buf();
+    const uint8_t* src = fb;
     for (int y = 0; y < DISPLAY_H; y++) {
-      const uint8_t* row = fb + y * FB_STRIDE;
+      const uint8_t* row = src + y * FB_STRIDE;
       for (int x = 0; x < DISPLAY_W; x++) {
         uint8_t bit = (row[x >> 3] >> (7 - (x & 7))) & 1;
         _disp.drawPixel(x, y, bit ? GxEPD_WHITE : GxEPD_BLACK);

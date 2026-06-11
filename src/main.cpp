@@ -80,13 +80,6 @@ void setup() {
   display.init(115200);
   display.setRotation(1);  // Portrait: 480 x 800
 
-  // ---- Framebuffer (PSRAM) ----
-  if (!g_fb.init()) {
-    Serial.println("ERROR: Framebuffer init failed!");
-    return;
-  }
-  Serial.println("Framebuffer OK");
-
   // ---- SD ----
   if (!SD.begin(SD_CS)) {
     Serial.println("ERROR: SD init failed!");

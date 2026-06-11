@@ -1,4 +1,4 @@
 #include "framebuffer.h"
 
-// Global framebuffer instance — allocated in PSRAM at runtime
-Framebuffer g_fb;
+PageBufferPool g_pool;
+Framebuffer    g_fb;    // single working buffer for layout-time use
