@@ -229,18 +229,38 @@ static bool loadSlot(int slot, int pageIdx) {
 
 // ---------------------------------------------------------------------------
 // showSlot — push a PSRAM slot to the e-ink panel.
-// `full` = true only for the very first page after power-on.
+//
+// The GD7965 partial waveform does not fully drive pixels to their extreme
+// black/white states — it only nudges them toward the target.  After ~5
+// partial refreshes the particles drift enough to cause visible fading,
+// ghost lines, and broken text (the "page 6 corruption" symptom).
+//
+// The industry-standard fix (used by Kindle, Kobo, etc.) is a periodic
+// full refresh ("global update") every N pages.  A full refresh slams all
+// pixels back to clean, well-defined states and eliminates the drift.
+//
+// PARTIAL_REFRESH_MAX  — number of partial refreshes between full refreshes.
+//   5 = safe default; increase to 7-10 if you prefer fewer pauses and can
+//       tolerate slightly more ghosting.
 // ---------------------------------------------------------------------------
-static bool g_firstShow = true;
+#define PARTIAL_REFRESH_MAX  5
+
+static bool g_firstShow     = true;
+static int  g_partialCount  = 0;   // partials since last full refresh
 
 static void showSlot(int slot) {
   const uint8_t* buf = g_pool.slotBuf(slot);
   if (!buf) return;
-  if (g_firstShow) {
-    g_firstShow = false;
-    renderer.showPageFull(buf);
+
+  bool doFull = g_firstShow || (g_partialCount >= PARTIAL_REFRESH_MAX);
+
+  if (doFull) {
+    g_firstShow    = false;
+    g_partialCount = 0;
+    renderer.showPageFull(buf);    // ~3.7 s — resets pixel states
   } else {
-    renderer.showPagePartial(buf);
+    ++g_partialCount;
+    renderer.showPagePartial(buf); // ~1.6 s — fast differential update
   }
 }
 
@@ -313,7 +333,7 @@ static void runCacheBuildMonitor() {
 // ---------------------------------------------------------------------------
 // displayTask — Core 0, read mode
 // ---------------------------------------------------------------------------
-#define DISPLAY_STACK 4096
+#define DISPLAY_STACK 8192
 
 static void displayTask(void* /*param*/) {
 

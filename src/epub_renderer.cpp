@@ -327,19 +327,36 @@ void EpubRenderer::showPageFull(const uint8_t* buf) {
 // ---------------------------------------------------------------------------
 // showPagePartial — fast partial refresh for all pages after the first.
 // ~1.6 s vs ~3.7 s for full refresh.
-// The controller computes the diff between "previous" and "new" buffers and
-// drives only changed pixels — clean, no ghosting.
+//
+// GD7965 partial waveform sequence:
+//   0x26 (OLD / previous) — set by the writeImageToPrevious() at the END
+//                           of the previous call; reflects what is on screen.
+//   0x24 (NEW)            — set by writeImage() below; reflects what we want.
+//   refresh(true)         — controller diffs OLD vs NEW and drives only the
+//                           changed pixels (~1.6 s waveform).
+//
+// After the refresh we update 0x26 = the page we just showed so the NEXT
+// call starts from the correct baseline.  This post-refresh write is safe
+// because writeImageToPrevious() is now correctly implemented in GxEPD2
+// v1.6.8+ (it was silently broken in v1.5.9, which caused the original
+// ghosting / accumulating-corruption bug).
 // ---------------------------------------------------------------------------
 void EpubRenderer::showPagePartial(const uint8_t* buf) {
   const uint8_t* native = portraitToNative(buf);
   if (!native) return;
-  // Write new content to the "new" controller buffer
-  _disp.writeImage(native, 0, 0, GxEPD2_750_T7::WIDTH, GxEPD2_750_T7::HEIGHT,
+  // Step 1: write the new page into the NEW (0x24) controller buffer.
+  _disp.writeImage(native, 0, 0,
+                   GxEPD2_750_T7::WIDTH, GxEPD2_750_T7::HEIGHT,
                    false, false, false);
-  _disp.refresh(true);    // true = partial refresh waveform (~1.6 s)
-  // Sync the "previous" buffer with the new content for the next diff
-  _disp.epd2.writeImageToPrevious(native, 0, 0, GxEPD2_750_T7::WIDTH,
-                                  GxEPD2_750_T7::HEIGHT, false, false, false);
+  // Step 2: fire the partial waveform.
+  //   OLD (0x26) = previous page  (set at end of last showPagePartial / showPageFull)
+  //   NEW (0x24) = this page      (just written above)
+  //   → controller drives only the pixels that changed.
+  _disp.refresh(true);   // true = partial refresh waveform (~1.6 s)
+  // Step 3: update OLD so the NEXT partial refresh uses the correct baseline.
+  _disp.epd2.writeImageToPrevious(native, 0, 0,
+                                  GxEPD2_750_T7::WIDTH, GxEPD2_750_T7::HEIGHT,
+                                  false, false, false);
 }
 
 void EpubRenderer::showSlotFull(int slot) {
