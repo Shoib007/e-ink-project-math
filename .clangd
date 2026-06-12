@@ -1,14 +1,30 @@
-CompileFlags:
-  BuiltinHeaders: QueryDriver
-Diagnostics:
-  Suppress: [pp_expects_filename, unused-includes]
----
 If:
   PathMatch: .*\.ino
 CompileFlags:
-  Remove: [-mlongcalls, -free, -mtext-section-literals, -fipa-pta, -fno-shrink-wrap]
   Add:
     - "-x"
     - "c++"
     - "-include"
     - "Arduino.h"
+---
+CompileFlags:
+  # Remove ESP32 GCC-specific flags that clangd/LLVM does not understand.
+  # These are valid xtensa-esp32s3-elf-gcc flags but cause clangd errors
+  # on all source file types (.cpp, .h, .c, .ino).
+  Remove:
+    - -mlongcalls
+    - -mlong-calls
+    - -free
+    - -mtext-section-literals
+    - -fipa-pta
+    - -fno-shrink-wrap
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+    - -mfix-esp32-psram-cache-issue
+    - -mfix-esp32-psram-cache-strategy=.*
+  BuiltinHeaders: QueryDriver
+
+Diagnostics:
+  Suppress:
+    - pp_expects_filename
+    - unused-includes

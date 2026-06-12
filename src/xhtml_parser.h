@@ -4,45 +4,66 @@
 #include "epub_types.h"
 
 // Callback invoked for each parsed render element.
-// Return false to stop parsing early.
+// Return false to stop parsing immediately (page-full signal).
 typedef bool (*ElemCallback)(const RenderElem& elem, void* ctx);
 
-// Streaming pull-parser for the EPUB XHTML format.
-// Reads the file from SD in small chunks; never loads the whole file.
+// ---------------------------------------------------------------------------
+// XhtmlParser — streaming pull-parser for EPUB XHTML.
+//
+// Usage for sliding-window rendering:
+//
+//   XhtmlParser parser;
+//
+//   // First page: opens the file and streams until callback returns false.
+//   parser.parse(path, basePath, cb, ctx);
+//
+//   // Subsequent pages: resumes from where the last parse() / resumeParse()
+//   // stopped.  Returns true if there is more content, false at EOF.
+//   while (parser.resumeParse(cb, ctx)) { ... }
+//
+// The file is kept open between calls.  Call close() when done.
+// ---------------------------------------------------------------------------
 class XhtmlParser {
 public:
-  // Parse the file at sdPath, calling cb for each element.
-  // basePath is the SD directory prefix for image paths (e.g. "/book3/EPUB/")
+  ~XhtmlParser() { close(); }
+
+  // Open the file and parse until cb returns false or EOF.
+  // Returns true if stopped early (more content remains), false at EOF.
   bool parse(const char* sdPath, const char* basePath,
              ElemCallback cb, void* ctx);
 
+  // Continue parsing from where we stopped.
+  // Returns true if stopped early, false at EOF.
+  bool resumeParse(ElemCallback cb, void* ctx);
+
+  // Close the file (called automatically on destruction).
+  void close();
+
 private:
-  // ---- internal helpers ----
-  File     _file;
-  char     _buf[256];   // read buffer
-  int      _bufLen = 0;
-  int      _bufPos = 0;
+  File      _file;
+  char      _buf[256];
+  int       _bufLen = 0;
+  int       _bufPos = 0;
 
-  // Current parser state
-  bool     _inMjx      = false;  // inside <mjx-container>
-  bool     _mjxDisplay = false;  // display="true" on current mjx-container
-  bool     _inPara     = false;
-  bool     _inHeading  = false;
-  FontLevel _headingLevel = FONT_H2;
-  char     _basePath[MAX_PATH_LEN];
+  bool      _inMjx       = false;
+  bool      _mjxDisplay  = false;
+  bool      _inPara      = false;
+  bool      _inHeading   = false;
+  FontLevel _headingLevel = FONT_BODY;
+  char      _basePath[MAX_PATH_LEN];
 
-  ElemCallback _cb;
-  void*        _ctx;
+  ElemCallback _cb  = nullptr;
+  void*        _ctx = nullptr;
 
-  // Read one character from SD (buffered)
+  bool      _open = false;   // true while file is open and usable
+
   int  readChar();
-  // Read until '<' building text content; emit ELEM_TEXT tokens
   bool readText(char stopAt);
-  // Read and process a complete tag starting after '<'
   bool processTag();
-  // Extract attribute value from a tag string
-  bool getAttrValue(const char* tag, const char* attr,
-                    char* out, int outLen);
-  // Emit a single element via callback
+  bool getAttrValue(const char* tag, const char* attr, char* out, int outLen);
   bool emit(RenderElem& e);
+
+  // Core streaming loop — returns true if cb returned false (stop-early),
+  // false at EOF.
+  bool streamLoop();
 };
