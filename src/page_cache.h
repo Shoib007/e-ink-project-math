@@ -25,10 +25,13 @@
 
 #define CACHE_DIR          "/cache"
 #define CACHE_META_PATH    "/cache/meta.bin"
-#define CACHE_MAGIC        0x45504742u   // 'EPGB'
+#define CACHE_MAGIC        0x45504743u   // 'EPGC' — bump version to invalidate old cache
 
-// Source XHTML path — used for staleness check
+// Source XHTML path — used for staleness check and as the entry point for rendering.
+// EPUB_BASE_PATH is prepended to every relative image path found in the XHTML.
+// Change BOTH constants when switching books; no other source file needs editing.
 #define XHTML_PATH         "/book3/EPUB/chap_01.xhtml"
+#define EPUB_BASE_PATH     "/book3/EPUB/"
 
 struct CacheMeta {
   uint32_t magic;

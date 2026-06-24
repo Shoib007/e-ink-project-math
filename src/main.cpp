@@ -157,7 +157,7 @@ static void cacheBuildTask(void* /*param*/) {
 
   // --- Page 0 ---
   renderer.beginPage(slotIdx);
-  bool more = parser.parse(XHTML_PATH, "/book3/EPUB/", onElement, nullptr);
+  bool more = parser.parse(XHTML_PATH, EPUB_BASE_PATH, onElement, nullptr);
   renderer.endPage();
 
   // Write page 0 to SD (take mutex so Core 0's display ops don't race)
@@ -249,18 +249,17 @@ static bool g_firstShow     = true;
 static int  g_partialCount  = 0;   // partials since last full refresh
 
 static void showSlot(int slot) {
-  const uint8_t* buf = g_pool.slotBuf(slot);
-  if (!buf) return;
+  if (!g_pool.slotBuf(slot)) return;
 
   bool doFull = g_firstShow || (g_partialCount >= PARTIAL_REFRESH_MAX);
 
   if (doFull) {
     g_firstShow    = false;
     g_partialCount = 0;
-    renderer.showPageFull(buf);    // ~3.7 s — resets pixel states
+    renderer.showPageFull(slot);    // ~3.7 s — resets pixel states
   } else {
     ++g_partialCount;
-    renderer.showPagePartial(buf); // ~1.6 s — fast differential update
+    renderer.showPagePartial(slot); // ~1.6 s — fast differential update
   }
 }
 
@@ -444,6 +443,7 @@ void IRAM_ATTR onBtnPrev() {
 }
 
 void loop() {
+  // ---- Button handling -------------------------------------------------------
   if (g_btnNextPending.load(std::memory_order_relaxed)) {
     g_btnNextPending.store(false, std::memory_order_relaxed);
     if (digitalRead(BTN_NEXT) == LOW) {
@@ -458,8 +458,37 @@ void loop() {
       xQueueSend(g_navQueue, &c, 0);
     }
   }
+
+  // ---- Serial command handler ------------------------------------------------
+  // Used by the "clear_cache" PlatformIO target (tools/clear_cache.py).
+  // Send  "!CLEARCACHE\n"  over serial to wipe /cache/meta.bin and restart,
+  // forcing a full re-render on the next boot.
+  static char    s_serialBuf[16];
+  static uint8_t s_serialIdx = 0;
+  while (Serial.available()) {
+    char ch = static_cast<char>(Serial.read());
+    if (ch == '\n' || ch == '\r') {
+      s_serialBuf[s_serialIdx] = '\0';
+      if (strcmp(s_serialBuf, "!CLEARCACHE") == 0) {
+        Serial.println("[Cache] Deleting /cache/meta.bin ...");
+        if (g_sdMutex) xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+        bool ok = SD.remove(CACHE_META_PATH);
+        if (g_sdMutex) xSemaphoreGive(g_sdMutex);
+        if (ok) Serial.println("[Cache] Deleted. Restarting...");
+        else    Serial.println("[Cache] Already clear. Restarting...");
+        delay(200);
+        ESP.restart();
+      }
+      s_serialIdx = 0;
+    } else {
+      if (s_serialIdx < sizeof(s_serialBuf) - 1)
+        s_serialBuf[s_serialIdx++] = ch;
+    }
+  }
+
   vTaskDelay(pdMS_TO_TICKS(5));
 }
+
 
 // ---------------------------------------------------------------------------
 // Status screen

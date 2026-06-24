@@ -10,33 +10,30 @@ typedef bool (*ElemCallback)(const RenderElem& elem, void* ctx);
 // ---------------------------------------------------------------------------
 // XhtmlParser — streaming pull-parser for EPUB XHTML.
 //
-// Usage for sliding-window rendering:
+// Supported elements
+//   Block/text:  h1, h2, h3, h4, p, strong/b, br
+//   Lists:       ol (with start="N"), li
+//   Images:      img inside mjx-container (PNG inline/block)
+//                img class="math-inline" anywhere (PNG inline)
+//                img with .jpg/.jpeg extension (JPEG block)
+//                img with .png extension outside mjx-container (PNG block)
+//   Tables:      table, thead, tbody, tr, th, td
+//                   Mixed cell content (text + inline PNGs) is accumulated
+//                   into the cell's text buffer using CELL_IMG_SENTINEL.
 //
+// Usage (same as before):
 //   XhtmlParser parser;
-//
-//   // First page: opens the file and streams until callback returns false.
-//   parser.parse(path, basePath, cb, ctx);
-//
-//   // Subsequent pages: resumes from where the last parse() / resumeParse()
-//   // stopped.  Returns true if there is more content, false at EOF.
-//   while (parser.resumeParse(cb, ctx)) { ... }
-//
-// The file is kept open between calls.  Call close() when done.
+//   parser.parse(path, basePath, cb, ctx);   // first page
+//   while (parser.resumeParse(cb, ctx)) { … } // subsequent pages
+//   parser.close();
 // ---------------------------------------------------------------------------
 class XhtmlParser {
 public:
   ~XhtmlParser() { close(); }
 
-  // Open the file and parse until cb returns false or EOF.
-  // Returns true if stopped early (more content remains), false at EOF.
   bool parse(const char* sdPath, const char* basePath,
              ElemCallback cb, void* ctx);
-
-  // Continue parsing from where we stopped.
-  // Returns true if stopped early, false at EOF.
   bool resumeParse(ElemCallback cb, void* ctx);
-
-  // Close the file (called automatically on destruction).
   void close();
 
 private:
@@ -45,25 +42,42 @@ private:
   int       _bufLen = 0;
   int       _bufPos = 0;
 
-  bool      _inMjx       = false;
-  bool      _mjxDisplay  = false;
-  bool      _inPara      = false;
-  bool      _inHeading   = false;
+  // ---- Block / text context -----------------------------------------------
+  bool      _inMjx        = false;
+  bool      _mjxDisplay   = false;
+  bool      _inPara       = false;
+  bool      _inHeading    = false;
   FontLevel _headingLevel = FONT_BODY;
+  bool      _inStrong     = false;   // inside <strong> or <b>
+
+  // ---- Ordered-list context -----------------------------------------------
+  bool      _inOl         = false;
+  int       _olCounter    = 1;       // next list-item number (respects start="N")
+  bool      _inLi         = false;
+
+  // ---- Table context -------------------------------------------------------
+  bool      _inTable      = false;
+  bool      _inTHead      = false;   // inside <thead>
+  bool      _inCell       = false;   // inside <td> or <th> — emit() buffers content
+  bool      _cellIsHeader = false;   // true when current cell tag was <th>
+  char      _cellBuf[300];           // accumulated cell text + CELL_IMG_SENTINEL image paths
+  int       _cellBufLen   = 0;
+
+  // ---- Book paths ---------------------------------------------------------
   char      _basePath[MAX_PATH_LEN];
 
   ElemCallback _cb  = nullptr;
   void*        _ctx = nullptr;
+  bool         _open = false;
 
-  bool      _open = false;   // true while file is open and usable
-
+  // ---- Internals ----------------------------------------------------------
   int  readChar();
   bool readText(char stopAt);
   bool processTag();
   bool getAttrValue(const char* tag, const char* attr, char* out, int outLen);
+
+  // emit() routes through cell-buffering when _inCell is true.
   bool emit(RenderElem& e);
 
-  // Core streaming loop — returns true if cb returned false (stop-early),
-  // false at EOF.
   bool streamLoop();
 };
