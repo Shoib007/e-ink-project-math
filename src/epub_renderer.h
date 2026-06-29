@@ -18,6 +18,7 @@
 
 #include "epub_types.h"
 #include "framebuffer.h"
+#include "table_renderer.h"
 
 typedef GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT / 2> DisplayType;
 
@@ -82,19 +83,8 @@ private:
   bool    _inListItem = false;
 
   // ---- Table state --------------------------------------------------------
-  static const int MAX_TABLE_COLS = 8;
-  struct TableCell {
-    char      text[256];    // may contain CELL_IMG_SENTINEL-wrapped image paths
-    FontLevel fontLevel;
-  };
-
-  bool       _inTable      = false;
-  bool       _inCellRender = false;  // suppresses checkPageOverflow() inside cells
-  int        _tableColCount = 0;
-  int        _tableCurCol   = 0;
-  int16_t    _tableColX[MAX_TABLE_COLS];
-  int16_t    _tableColW[MAX_TABLE_COLS];
-  TableCell  _tableCells[MAX_TABLE_COLS];
+  TableRenderer _table;
+  bool          _inTable    = false;   // true between ELEM_TABLE_START / ELEM_TABLE_END
 
   // ---- Image decode -------------------------------------------------------
   int16_t  _imgDestX = 0;
@@ -120,9 +110,20 @@ private:
   void    renderBlockImage  (const char* path);
   void    renderBlockImageJpg(const char* path);
 
-  void    renderTableRow();
-  void    renderCellContent(const TableCell& cell, int16_t x, int16_t y, int16_t w);
-  int16_t measureCellHeight(const char* text, FontLevel level, int16_t colW);
+  void    renderTableCell (const char* text, FontLevel lvl,
+                            int16_t pixX, int16_t pixY,
+                            int16_t colW, int16_t cellH);
+  int16_t measureTableCell(const char* text, FontLevel lvl, int16_t colW);
+
+  // ---- Table row accumulation (pending row buffer) ------------------------
+  static const int MAX_TABLE_COLS = 8;
+  struct TableCell {
+    char      text[MAX_TEXT_LEN];
+    FontLevel fontLevel;
+  };
+  bool       _inCellRender = false;  // suppresses overflow checks inside cells
+  int        _tableCurCol  = 0;
+  TableCell  _tableCells[MAX_TABLE_COLS];
 
   void    drawHLine(int16_t x, int16_t y, int16_t w);
   void    drawVLine(int16_t x, int16_t y, int16_t h);

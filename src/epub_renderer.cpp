@@ -195,10 +195,20 @@ void EpubRenderer::beginPage(int slot) {
   _wrapLeftMargin = MARGIN_LEFT;
   _rightBound     = DISPLAY_W - MARGIN_RIGHT;
   _inListItem     = false;
-  _inTable        = false;
   _inCellRender   = false;
-  _tableColCount  = 0;
-  _tableCurCol    = 0;
+
+  // If a table was mid-row when the previous page filled up, resume it at
+  // the top of this new page.  _tableCurCol and the cell buffer are preserved
+  // by feed() (it does NOT reset them on ROW_PAGE_FULL).
+  if (_inTable && _table.isActive()) {
+    int16_t newTop = _cy - _bodyFontAscent;   // = MARGIN_TOP
+    int16_t newBot = DISPLAY_H - MARGIN_BOTTOM;
+    _table.continueOnPage(newTop, newBot);
+    // _cy stays at MARGIN_TOP + _bodyFontAscent; the table row will update it.
+  } else {
+    _inTable     = false;
+    _tableCurCol = 0;
+  }
 }
 
 void EpubRenderer::endPage() {
@@ -518,18 +528,17 @@ void EpubRenderer::renderBlockImageJpg(const char* path) {
 }
 
 // ===========================================================================
-// measureCellHeight
+// measureTableCell — callback supplied to TableRenderer::endRow().
 //
 // Simulates word-wrap within colW without drawing anything.
-// Returns the content height (px) needed for the given cell text.
-// Handles CELL_IMG_SENTINEL-embedded images (estimated at 40px wide).
+// Returns the CONTENT height (px) needed; padding is added by TableRenderer.
+// Handles CELL_IMG_SENTINEL-embedded images (estimated height).
 // ===========================================================================
-int16_t EpubRenderer::measureCellHeight(const char* text,
-                                         FontLevel   level,
-                                         int16_t     colW) {
+int16_t EpubRenderer::measureTableCell(const char* text,
+                                        FontLevel   level,
+                                        int16_t     colW) {
   selectFont(level);
 
-  // Measure reference glyph height
   int16_t bx, by; uint16_t bw, bh;
   _canvas.getTextBounds("Ag", 0, 0, &bx, &by, &bw, &bh);
   int16_t fontH = static_cast<int16_t>(bh > 0 ? bh : 14);
@@ -548,7 +557,7 @@ int16_t EpubRenderer::measureCellHeight(const char* text,
     int16_t needed = (cx > 0) ? static_cast<int16_t>(tw) + 4
                                : static_cast<int16_t>(tw);
     if (cx > 0 && cx + needed > colW) { ++lineCount; cx = static_cast<int16_t>(tw); }
-    else                                cx += needed;
+    else                               cx += needed;
   };
 
   while (*p) {
@@ -557,7 +566,7 @@ int16_t EpubRenderer::measureCellHeight(const char* text,
       ++p;
       while (*p && *p != CELL_IMG_SENTINEL) ++p;
       if (*p) ++p;
-      // Inline image: estimate 40px wide
+      // Estimate inline image as one line tall
       if (cx + 40 > colW && cx > 0) { ++lineCount; cx = 40; }
       else cx += 42;
       continue;
@@ -575,15 +584,22 @@ int16_t EpubRenderer::measureCellHeight(const char* text,
 }
 
 // ===========================================================================
-// renderCellContent
+// renderTableCell — callback supplied to TableRenderer::endRow().
 //
-// Draws a single table cell's content into the rectangle (x, y, w, rowH).
-// Saves and restores all cursor / bound state so the outer renderer is
-// completely unaffected.  Page-overflow checks are suppressed while inside
-// this function (_inCellRender = true).
+// Draws one cell's text content into the pixel rectangle
+// (pixX, pixY) .. (pixX+colW, pixY+cellH).
+//
+// pixX, pixY : TOP-LEFT pixel of the content area (padding already removed).
+// colW       : pixel width of the content area.
+// cellH      : pixel height of the content area (used for vertical centring).
+//
+// _cy is temporarily set to the TEXT BASELINE of the first line, computed as:
+//   pixY + fontAscent(level)
+// so that renderWord() draws correctly without touching the outer _cy.
 // ===========================================================================
-void EpubRenderer::renderCellContent(const TableCell& cell,
-                                      int16_t x, int16_t y, int16_t w) {
+void EpubRenderer::renderTableCell(const char* text, FontLevel level,
+                                    int16_t pixX, int16_t pixY,
+                                    int16_t colW,  int16_t /*cellH*/) {
   // ---- Save outer state ---------------------------------------------------
   int16_t savedCx    = _cx;
   int16_t savedCy    = _cy;
@@ -594,37 +610,40 @@ void EpubRenderer::renderCellContent(const TableCell& cell,
   bool    savedFull  = _pageFull;
 
   // ---- Set cell-local state -----------------------------------------------
-  _cx             = x;
-  _cy             = y;
+  // _cy is a TEXT BASELINE.  Position it so the TOP of the first glyph sits
+  // exactly at pixY (top of the content area).
+  int16_t cellAscent = fontAscent(level);
+  _cx             = pixX;
+  _cy             = pixY + cellAscent;    // baseline = top + ascent
   _lineH          = 0;
   _lineHasContent = false;
-  _wrapLeftMargin = x;
-  _rightBound     = x + w;
+  _wrapLeftMargin = pixX;
+  _rightBound     = pixX + colW;
   _pageFull       = false;
-  _inCellRender   = true;
+  _inCellRender   = true;   // suppress checkPageOverflow() inside the cell
 
   // ---- Walk cell text, handle CELL_IMG_SENTINEL-embedded image paths -------
-  const char* p        = cell.text;
+  const char* p  = text;
   char        word[MAX_TEXT_LEN];
-  int         wi       = 0;
+  int         wi = 0;
   bool        hadSpace = false;
 
-  auto flushCellWord = [&]() {
+  auto flushWord = [&]() {
     if (wi == 0) return;
     word[wi] = '\0'; wi = 0;
     char tmp[MAX_TEXT_LEN];
     if (hadSpace) {
       snprintf(tmp, sizeof(tmp), " %s", word);
-      renderWord(tmp, cell.fontLevel);
+      renderWord(tmp, level);
     } else {
-      renderWord(word, cell.fontLevel);
+      renderWord(word, level);
     }
     hadSpace = false;
   };
 
   while (*p) {
     if (*p == CELL_IMG_SENTINEL) {
-      flushCellWord();
+      flushWord();
       ++p;
       char imgPath[MAX_PATH_LEN]; int pi = 0;
       while (*p && *p != CELL_IMG_SENTINEL && pi < MAX_PATH_LEN - 1)
@@ -632,15 +651,15 @@ void EpubRenderer::renderCellContent(const TableCell& cell,
       imgPath[pi] = '\0';
       if (*p == CELL_IMG_SENTINEL) ++p;
 
-      // Decode inline PNG at current cell cursor — apply same spacing as
-      // renderInlineImage() (pre/post gap; descent not applied in cell context
-      // since cell _cy is top-of-cell, not a text baseline).
+      // Measure then draw inline PNG, aligned to text baseline
       uint16_t imgW = 0, imgH = 0;
-      if (_lineHasContent) _cx += INLINE_IMG_SPACE;
-      decodePng(imgPath, _cx, _cy, imgW, imgH, false);
-      if (imgW > 0) {
+      if (decodePng(imgPath, 0, 0, imgW, imgH, true) && imgW > 0 && imgH > 0) {
+        if (_lineHasContent) _cx += INLINE_IMG_SPACE;
+        int16_t imgDestY = _cy - static_cast<int16_t>(imgH) + INLINE_IMG_DESCENT;
+        decodePng(imgPath, _cx, imgDestY, imgW, imgH, false);
         _cx += static_cast<int16_t>(imgW) + INLINE_IMG_SPACE;
-        if (static_cast<int16_t>(imgH) > _lineH) _lineH = static_cast<int16_t>(imgH);
+        int16_t imgAscent = static_cast<int16_t>(imgH) - INLINE_IMG_DESCENT;
+        if (imgAscent > _lineH) _lineH = imgAscent;
         _lineHasContent = true;
       }
       hadSpace = false;
@@ -648,13 +667,13 @@ void EpubRenderer::renderCellContent(const TableCell& cell,
     }
     char c = *p++;
     if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
-      flushCellWord();
+      flushWord();
       hadSpace = true;
     } else {
       if (wi < static_cast<int>(sizeof(word)) - 1) word[wi++] = c;
     }
   }
-  flushCellWord();
+  flushWord();
 
   // ---- Restore outer state ------------------------------------------------
   _inCellRender   = false;
@@ -665,71 +684,6 @@ void EpubRenderer::renderCellContent(const TableCell& cell,
   _wrapLeftMargin = savedWrap;
   _rightBound     = savedRight;
   _pageFull       = savedFull;
-}
-
-// ===========================================================================
-// renderTableRow
-//
-// Renders the cells buffered in _tableCells[0.._tableCurCol-1]:
-//   • First row:  compute equal column widths spanning MARGIN_LEFT…MARGIN_RIGHT.
-//   • Every row:  measure max cell height, check page overflow,
-//                 draw top border + vertical borders, render each cell.
-//
-// Note: if the row triggers page-full, the row is dropped (content lost).
-// For this ebook's small tables this edge case is unlikely.
-// ===========================================================================
-void EpubRenderer::renderTableRow() {
-  if (_tableCurCol == 0) return;
-
-  // ---- First row: establish column layout ---------------------------------
-  if (_tableColCount == 0) {
-    _tableColCount = _tableCurCol;
-    int16_t tableW  = DISPLAY_W - MARGIN_LEFT - MARGIN_RIGHT;
-    int16_t borders = static_cast<int16_t>(_tableColCount + 1) * TABLE_BORDER_W;
-    int16_t colW    = (tableW - borders) / static_cast<int16_t>(_tableColCount);
-    int16_t extra   = (tableW - borders) - colW * static_cast<int16_t>(_tableColCount);
-
-    for (int i = 0; i < _tableColCount; ++i) {
-      _tableColX[i] = MARGIN_LEFT
-                    + static_cast<int16_t>(i + 1) * TABLE_BORDER_W
-                    + static_cast<int16_t>(i) * colW;
-      // Last column gets the rounding remainder so the right border is flush
-      _tableColW[i] = (i == _tableColCount - 1) ? colW + extra : colW;
-    }
-  }
-
-  // ---- Measure row height -------------------------------------------------
-  int16_t rowH = 4;   // minimum
-  int     cols = (_tableCurCol < _tableColCount) ? _tableCurCol : _tableColCount;
-  for (int i = 0; i < cols; ++i) {
-    int16_t h = measureCellHeight(_tableCells[i].text,
-                                   _tableCells[i].fontLevel,
-                                   _tableColW[i] - 2 * TABLE_CELL_PAD);
-    if (h > rowH) rowH = h;
-  }
-  rowH += 2 * TABLE_CELL_PAD;   // add top + bottom cell padding
-
-  // ---- Page overflow check (at row level) ---------------------------------
-  checkPageOverflow(rowH + TABLE_BORDER_W);
-  if (_pageFull) return;
-
-  // ---- Top border of this row ---------------------------------------------
-  drawHLine(MARGIN_LEFT, _cy, DISPLAY_W - MARGIN_LEFT - MARGIN_RIGHT);
-  _cy += TABLE_BORDER_W;
-
-  // ---- Render each cell + its left vertical border ------------------------
-  for (int i = 0; i < cols; ++i) {
-    drawVLine(_tableColX[i] - TABLE_BORDER_W, _cy, rowH);
-    renderCellContent(_tableCells[i],
-                      _tableColX[i] + TABLE_CELL_PAD,
-                      _cy + TABLE_CELL_PAD,
-                      _tableColW[i] - 2 * TABLE_CELL_PAD);
-  }
-  // Right outer border
-  int16_t rightX = _tableColX[_tableColCount - 1] + _tableColW[_tableColCount - 1];
-  drawVLine(rightX, _cy, rowH);
-
-  _cy += rowH;
 }
 
 // ===========================================================================
@@ -800,42 +754,98 @@ bool EpubRenderer::feed(const RenderElem& elem) {
     }
 
     // ---- Table --------------------------------------------------------------
-    case ELEM_TABLE_START:
+    // The table uses TableRenderer which works in PURE PIXEL coordinates,
+    // completely decoupled from the text-baseline (_cy) system.
+    //
+    // _cy is a text baseline; the table top pixel = _cy - _bodyFontAscent.
+    // After the table we advance _cy by (tablePixelH + PARA_SPACING).
+    // -------------------------------------------------------------------------
+    case ELEM_TABLE_START: {
       if (_lineHasContent) newLine();
-      _inTable       = true;
-      _tableColCount = 0;
-      _tableCurCol   = 0;
+      _inTable = true;
+      _tableCurCol = 0;
+      // top pixel of table = top of current line slot
+      int16_t topPixel = _cy - _bodyFontAscent;
+      int16_t botPixel = DISPLAY_H - MARGIN_BOTTOM;
+      _table.begin(topPixel, botPixel);
       break;
+    }
 
     case ELEM_TABLE_HEADER_CELL:
     case ELEM_TABLE_DATA_CELL:
       if (_tableCurCol < MAX_TABLE_COLS) {
-        strncpy(_tableCells[_tableCurCol].text, elem.text, 255);
-        _tableCells[_tableCurCol].text[255] = '\0';
+        strncpy(_tableCells[_tableCurCol].text, elem.text, MAX_TEXT_LEN - 1);
+        _tableCells[_tableCurCol].text[MAX_TEXT_LEN - 1] = '\0';
         _tableCells[_tableCurCol].fontLevel = elem.fontLevel;
         ++_tableCurCol;
       }
       break;
 
-    case ELEM_TABLE_ROW_END:
-      if (_inTable) renderTableRow();
-      // If the row triggered page-full, do NOT reset the column buffer.
-      // This allows the next page to re-feed this row and successfully render it.
-      if (!_pageFull) {
-        _tableCurCol = 0;
-      }
-      break;
+    case ELEM_TABLE_ROW_END: {
+      if (!_inTable || _tableCurCol == 0) break;
 
-    case ELEM_TABLE_END:
-      if (_inTable) {
-        // Bottom border
-        drawHLine(MARGIN_LEFT, _cy, DISPLAY_W - MARGIN_LEFT - MARGIN_RIGHT);
-        _cy           += TABLE_BORDER_W + PARA_SPACING;
-        _tableColCount = 0;
-        _tableCurCol   = 0;
-        _inTable       = false;
+      // Build the row in the table engine
+      _table.startRow();
+      for (int i = 0; i < _tableCurCol; ++i)
+        _table.addCell(_tableCells[i].text, _tableCells[i].fontLevel);
+
+      // ---- Callbacks (thin lambdas → EpubRenderer private methods) --------
+      auto hLineCb = [](int16_t x, int16_t y, int16_t w, void* ctx) {
+        static_cast<EpubRenderer*>(ctx)->drawHLine(x, y, w);
+      };
+      auto vLineCb = [](int16_t x, int16_t y, int16_t h, void* ctx) {
+        static_cast<EpubRenderer*>(ctx)->drawVLine(x, y, h);
+      };
+      auto measureCb = [](const char* txt, FontLevel lvl, int16_t colW, void* ctx) -> int16_t {
+        return static_cast<EpubRenderer*>(ctx)->measureTableCell(txt, lvl, colW);
+      };
+      auto drawCb = [](const char* txt, FontLevel lvl,
+                        int16_t px, int16_t py, int16_t colW, int16_t cellH,
+                        void* ctx) {
+        static_cast<EpubRenderer*>(ctx)->renderTableCell(txt, lvl, px, py, colW, cellH);
+      };
+
+      TableRenderer::RowResult r = _table.endRow(hLineCb, vLineCb, measureCb, drawCb, this);
+
+      if (r == TableRenderer::ROW_PAGE_FULL) {
+        // Page is full: advance _cy past page boundary, signal overflow.
+        // The overflow mechanism in main.cpp will start a new page and
+        // re-feed ELEM_TABLE_ROW_END; continueOnPage() is called from
+        // ELEM_TABLE_START re-processing — but since we are MID-table we
+        // cannot re-emit ELEM_TABLE_START.  Instead we signal page-full so
+        // main.cpp calls beginPage() for us, then we call continueOnPage().
+        signalPageFull();
+        // Don't reset _tableCurCol — the row buffer must survive for retry.
+      } else {
+        _tableCurCol = 0;
+        // Sync _cy: move it so the next text after the last drawn row starts
+        // below the last table row.  _table.currentPixelY() is the pixel Y
+        // of the NEXT top border (= bottom of last drawn row).
+        // Set _cy = tableBottom + _bodyFontAscent (baseline of a body line
+        // whose top sits exactly at tableBottom).
+        _cy = _table.currentPixelY() + _bodyFontAscent;
       }
       break;
+    }
+
+    case ELEM_TABLE_END: {
+      if (_inTable) {
+        // Draw the final bottom border and get the pixel Y below it.
+        auto hLineCb = [](int16_t x, int16_t y, int16_t w, void* ctx) {
+          static_cast<EpubRenderer*>(ctx)->drawHLine(x, y, w);
+        };
+        int16_t endPixel = _table.finish(hLineCb, this);
+        // Advance _cy to just below the table bottom border + dedicated gap.
+        // Tune TABLE_AFTER_SPACING in epub_types.h if the gap needs adjusting.
+        _cy      = endPixel + TABLE_AFTER_SPACING + _bodyFontAscent;
+        _cx      = MARGIN_LEFT;
+        _lineH   = 0;
+        _lineHasContent = false;
+        _tableCurCol    = 0;
+        _inTable        = false;
+      }
+      break;
+    }
   }
   return !_pageFull;
 }

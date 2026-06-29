@@ -23,26 +23,20 @@
 #include <SD.h>
 #include "framebuffer.h"   // for FB_SIZE, FB_STRIDE
 
-#define CACHE_DIR          "/cache"
-#define CACHE_META_PATH    "/cache/meta.bin"
 #define CACHE_MAGIC        0x45504743u   // 'EPGC' — bump version to invalidate old cache
-
-// Source XHTML path — used for staleness check and as the entry point for rendering.
-// EPUB_BASE_PATH is prepended to every relative image path found in the XHTML.
-// Change BOTH constants when switching books; no other source file needs editing.
-#define XHTML_PATH         "/book3/EPUB/chap_01.xhtml"
-#define EPUB_BASE_PATH     "/book3/EPUB/"
 
 struct CacheMeta {
   uint32_t magic;
   uint32_t pageCount;
-  uint32_t sourceSize;   // size of XHTML file at render time
+  uint32_t sourceSize;   // sum of sizes of all XHTML files
 };
 
-// Build the SD path for page index `idx`  (e.g. index 3 → "/cache/p0003.bin")
-inline void cachePagePath(int idx, char* out, int outLen) {
-  snprintf(out, outLen, "%s/p%04d.bin", CACHE_DIR, idx);
+// Build the SD path for page index `idx` (e.g. index 3 → "/cache/jemh1a2/p0003.bin")
+inline void cachePagePath(const char* cacheDir, int idx, char* out, int outLen) {
+  snprintf(out, outLen, "%s/p%04d.bin", cacheDir, idx);
 }
+
+
 
 // ---------------------------------------------------------------------------
 // CacheWriter — called from renderTask (Core 1) to persist each page.
@@ -55,16 +49,21 @@ inline void cachePagePath(int idx, char* out, int outLen) {
 // ---------------------------------------------------------------------------
 class CacheWriter {
 public:
-  bool begin(uint32_t sourceSize) {
-    _sourceSize = sourceSize;
-    // Ensure /cache directory exists
-    if (!SD.exists(CACHE_DIR)) SD.mkdir(CACHE_DIR);
+  bool begin(const char* cacheDir, uint32_t totalSourceSize) {
+    strncpy(_cacheDir, cacheDir, sizeof(_cacheDir) - 1);
+    _cacheDir[sizeof(_cacheDir) - 1] = '\0';
+    _sourceSize = totalSourceSize;
+
+    // Ensure /cache exists
+    if (!SD.exists("/cache")) SD.mkdir("/cache");
+    // Ensure /cache/bookname exists
+    if (!SD.exists(_cacheDir)) SD.mkdir(_cacheDir);
     return true;
   }
 
   bool writePage(int idx, const uint8_t* buf) {
-    char path[32];
-    cachePagePath(idx, path, sizeof(path));
+    char path[80];
+    cachePagePath(_cacheDir, idx, path, sizeof(path));
     // Remove stale file if it exists
     if (SD.exists(path)) SD.remove(path);
     File f = SD.open(path, FILE_WRITE);
@@ -78,9 +77,12 @@ public:
   }
 
   bool finish(uint32_t pageCount) {
+    char metaPath[80];
+    snprintf(metaPath, sizeof(metaPath), "%s/meta.bin", _cacheDir);
+
     // Write metadata last — presence of meta.bin signals a complete cache
-    if (SD.exists(CACHE_META_PATH)) SD.remove(CACHE_META_PATH);
-    File f = SD.open(CACHE_META_PATH, FILE_WRITE);
+    if (SD.exists(metaPath)) SD.remove(metaPath);
+    File f = SD.open(metaPath, FILE_WRITE);
     if (!f) return false;
     CacheMeta m;
     m.magic      = CACHE_MAGIC;
@@ -93,6 +95,7 @@ public:
   }
 
 private:
+  char     _cacheDir[64];
   uint32_t _sourceSize = 0;
 };
 
@@ -102,10 +105,13 @@ private:
 // ---------------------------------------------------------------------------
 class CacheReader {
 public:
-  // Check whether a valid, up-to-date cache exists.
+  // Check whether a valid, up-to-date cache exists for this book.
   // Returns true and fills meta if valid; false otherwise.
-  static bool probe(CacheMeta& meta) {
-    File f = SD.open(CACHE_META_PATH);
+  static bool probe(const char* cacheDir, uint32_t actualTotalSize, CacheMeta& meta) {
+    char metaPath[80];
+    snprintf(metaPath, sizeof(metaPath), "%s/meta.bin", cacheDir);
+
+    File f = SD.open(metaPath);
     if (!f) return false;
     if (f.read(reinterpret_cast<uint8_t*>(&meta), sizeof(meta)) != sizeof(meta)) {
       f.close(); return false;
@@ -114,18 +120,14 @@ public:
     if (meta.magic != CACHE_MAGIC) return false;
 
     // Check source file size for staleness
-    File src = SD.open(XHTML_PATH);
-    if (!src) return false;
-    uint32_t actualSize = src.size();
-    src.close();
-    return actualSize == meta.sourceSize;
+    return actualTotalSize == meta.sourceSize;
   }
 
   // Load page `idx` into `buf` (must be FB_SIZE bytes).
   // Returns true on success.
-  static bool loadPage(int idx, uint8_t* buf) {
-    char path[32];
-    cachePagePath(idx, path, sizeof(path));
+  static bool loadPage(const char* cacheDir, int idx, uint8_t* buf) {
+    char path[80];
+    cachePagePath(cacheDir, idx, path, sizeof(path));
     File f = SD.open(path);
     if (!f) { Serial.printf("[Cache] Missing %s\n", path); return false; }
     size_t got = f.read(buf, FB_SIZE);

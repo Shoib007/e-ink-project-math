@@ -36,6 +36,7 @@
 // ---------------------------------------------------------------------------
 #define TABLE_BORDER_W   1   // border line thickness in pixels
 #define TABLE_CELL_PAD   3   // padding (px) inside each cell (top/bottom + left/right)
+#define TABLE_AFTER_SPACING 28  // gap (px) below the table's bottom border before next element
 
 // ---------------------------------------------------------------------------
 // Sentinel for mixed-content table cells.

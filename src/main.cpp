@@ -1,67 +1,8 @@
-/*
- * main.cpp — EPUB Reader  (XIAO ESP32-S3 + GxEPD2 7.5" e-ink)
- * =============================================================
- *
- * BOOT FLOW
- * ---------
- *  1. Check SD for a valid page cache (/cache/p0000.bin … meta.bin).
- *     If valid → jump straight to READ MODE.
- *     If stale / missing → enter CACHE BUILD MODE.
- *
- *  CACHE BUILD MODE (one-time, ~same wall-clock as before but only once)
- *  -----------------------------------------------------------------------
- *  Core 0:  Shows "Building cache N/M…" progress screen with a full refresh
- *           after the first page and partial refreshes for the rest.
- *  Core 1:  Streams XHTML → renders pages one by one → writes each raw
- *           48 KB bitmap to SD as /cache/pNNNN.bin.
- *           Signals Core 0 after each page via g_pageCachedSem.
- *           When done writes /cache/meta.bin (marks cache complete).
- *
- *  READ MODE  (every subsequent boot, or after cache build completes)
- *  -----------------------------------------------------------------------
- *  3 PSRAM slots (prev / current / next) of 48 KB each.
- *  Displaying a page = SD.read(48 KB) + writeImage() + refresh(partial).
- *    Total:  ~200 ms SD read  +  ~1 600 ms partial waveform  =  ~1.8 s
- *    vs old: ~200 ms copy loop  +  ~3 700 ms full waveform   =  ~3.9 s
- *
- *  PARTIAL REFRESH CORRECTNESS
- *  -----------------------------------------------------------------------
- *  The GD7965 controller uses a differential waveform that compares its
- *  "previous" and "new" frame buffers to decide which pixels to drive.
- *  We must keep them in sync:
- *    - First page after power-on: showPageFull()  → writes BOTH buffers.
- *    - All later pages:           showPagePartial() → writes new, copies
- *                                 same data to previous so next diff is clean.
- *
- *  SLIDING WINDOW
- *  -----------------------------------------------------------------------
- *  g_role[PREV/CUR/NEXT] maps logical role → physical slot (0-2).
- *  On NEXT: show slot[NEXT], rotate roles, load new NEXT from SD cache.
- *  On PREV: show slot[PREV], rotate roles backward.
- *  Loading from cache happens in displayTask itself (SD read is ~200 ms,
- *  fast enough to be invisible compared with the 1.6 s waveform).
- *
- *  SPI BUS
- *  -----------------------------------------------------------------------
- *  SD and e-ink share SPI.  g_sdMutex serialises them.
- *  During cache build:
- *    Core 1 takes mutex only while writing a page file to SD.
- *    Core 0 takes mutex for display operations.
- *  During read mode:
- *    displayTask takes mutex for SD load + e-ink transfer together.
- *    No Core 1 activity on SPI after cache is complete.
- *
- *  BUTTONS
- *  -----------------------------------------------------------------------
- *  ISR → 50 ms hardware debounce → atomic flag → loop() → g_navQueue.
- *  loop() never blocks, never touches SPI.
- */
-
 #include <Arduino.h>
 #include <SPI.h>
 #include <SD.h>
 #include <GxEPD2_BW.h>
-#include <freertos/FreeRTOS.h>
+#include <Fonts/FreeSans9pt7b.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include <freertos/queue.h>
@@ -73,6 +14,7 @@
 #include "xhtml_parser.h"
 #include "epub_renderer.h"
 #include "page_cache.h"
+#include "book_scanner.h"
 
 // ---------------------------------------------------------------------------
 // Pins
@@ -95,15 +37,26 @@ GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT / 2> display(
 EpubRenderer renderer(display);
 
 // ---------------------------------------------------------------------------
+// App States & Books
+// ---------------------------------------------------------------------------
+enum AppState { STATE_BOOK_SELECT, STATE_CACHE_BUILD, STATE_READ };
+static AppState g_appState = STATE_BOOK_SELECT;
+
+static BookInfo g_books[MAX_BOOKS];
+static int g_numBooks = 0;
+static int g_selectedBookIdx = 0;
+static BookInfo* g_currentBook = nullptr;
+static uint32_t g_totalSourceSize = 0;
+
+// ---------------------------------------------------------------------------
 // RTOS objects
 // ---------------------------------------------------------------------------
 enum NavCmd : uint8_t { NAV_NEXT = 0, NAV_PREV = 1 };
 
 SemaphoreHandle_t g_sdMutex       = nullptr;
 QueueHandle_t     g_navQueue      = nullptr;
-
-// Used only during cache build:
 SemaphoreHandle_t g_pageCachedSem = nullptr;  // Core 1 gives, Core 0 takes
+TaskHandle_t      g_displayTaskHandle = nullptr;
 
 // ---------------------------------------------------------------------------
 // Slot ring (read mode)
@@ -113,7 +66,7 @@ static int  g_role[3]      = {0, 1, 2};
 static int  g_slotPage[3]  = {-1, -1, -1};
 static bool g_slotValid[3] = {false, false, false};
 
-static int  g_totalPages   = 0;    // set after cache is confirmed/built
+static int  g_totalPages   = 0;
 
 // ---------------------------------------------------------------------------
 // Cache-build state (Core 1 render task)
@@ -121,10 +74,8 @@ static int  g_totalPages   = 0;    // set after cache is confirmed/built
 static std::atomic<int>  g_pagesBuilt{0};
 static std::atomic<bool> g_buildDone{false};
 
-// Overflow element for page-break tracking
 struct OverflowElem { bool valid = false; RenderElem elem; };
 static OverflowElem g_overflow;
-static int          g_nextPageIdx = 1;
 
 static bool onElement(const RenderElem& elem, void* /*ctx*/) {
   bool ok = renderer.feed(elem);
@@ -136,90 +87,74 @@ static bool onElement(const RenderElem& elem, void* /*ctx*/) {
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// cacheBuildTask — Core 1
-// Renders all pages sequentially, writes each to SD, signals Core 0.
-// ---------------------------------------------------------------------------
 static void cacheBuildTask(void* /*param*/) {
   Serial.printf("[Core1] Cache build task on core %d\n", xPortGetCoreID());
 
-  // Get source file size for staleness detection
-  File src = SD.open(XHTML_PATH);
-  uint32_t srcSize = src ? src.size() : 0;
-  if (src) src.close();
-
   CacheWriter writer;
-  writer.begin(srcSize);
+  writer.begin(g_currentBook->cacheDir, g_totalSourceSize);
 
-  XhtmlParser parser;
-  bool parserDone = false;
-  int  slotIdx    = 0;   // we reuse slot 0 as the render scratch buffer
+  int slotIdx = 0;
+  int pageNum = 0;
 
-  // --- Page 0 ---
-  renderer.beginPage(slotIdx);
-  bool more = parser.parse(XHTML_PATH, EPUB_BASE_PATH, onElement, nullptr);
-  renderer.endPage();
+  for (int i = 0; i < g_currentBook->xhtmlCount; i++) {
+    char xhtmlPath[128];
+    snprintf(xhtmlPath, sizeof(xhtmlPath), "%s%s", g_currentBook->basePath, g_currentBook->xhtmlFiles[i]);
+    
+    Serial.printf("[Core1] Parsing %s\n", xhtmlPath);
+    XhtmlParser parser;
+    bool more = true;
+    bool first = true;
+    bool parserDone = false;
 
-  // Write page 0 to SD (take mutex so Core 0's display ops don't race)
-  xSemaphoreTake(g_sdMutex, portMAX_DELAY);
-  writer.writePage(0, g_pool.slotBuf(slotIdx));
-  xSemaphoreGive(g_sdMutex);
+    while (!parserDone) {
+      renderer.beginPage(slotIdx);
 
-  g_pagesBuilt.store(1, std::memory_order_release);
-  xSemaphoreGive(g_pageCachedSem);   // tell Core 0: first page is ready
+      if (g_overflow.valid) {
+        g_overflow.valid = false;
+        if (!renderer.feed(g_overflow.elem))
+          Serial.println("[Core1] WARN: element too large, dropped.");
+      }
 
-  if (!more && !g_overflow.valid) {
-    writer.finish(1);
-    g_totalPages = 1;
-    g_buildDone.store(true, std::memory_order_release);
-    xSemaphoreGive(g_pageCachedSem);
-    vTaskDelete(nullptr); return;
-  }
+      if (first) {
+        more = parser.parse(xhtmlPath, g_currentBook->basePath, onElement, nullptr);
+        first = false;
+      } else {
+        more = parser.resumeParse(onElement, nullptr);
+      }
 
-  // --- Pages 1 … N ---
-  while (!parserDone) {
-    renderer.beginPage(slotIdx);
+      if (!more && !g_overflow.valid) {
+        parserDone = true;
+      }
 
-    if (g_overflow.valid) {
-      g_overflow.valid = false;
-      if (!renderer.feed(g_overflow.elem))
-        Serial.println("[Core1] WARN: element too large, dropped.");
+      renderer.endPage();
+
+      xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+      writer.writePage(pageNum, g_pool.slotBuf(slotIdx));
+      xSemaphoreGive(g_sdMutex);
+
+      pageNum++;
+      g_pagesBuilt.store(pageNum, std::memory_order_release);
+      xSemaphoreGive(g_pageCachedSem);
     }
-
-    more = parser.resumeParse(onElement, nullptr);
-    if (!more && !g_overflow.valid) parserDone = true;
-
-    renderer.endPage();
-
-    int pageNum = g_nextPageIdx++;
-    xSemaphoreTake(g_sdMutex, portMAX_DELAY);
-    writer.writePage(pageNum, g_pool.slotBuf(slotIdx));
-    xSemaphoreGive(g_sdMutex);
-
-    g_pagesBuilt.store(pageNum + 1, std::memory_order_release);
-    xSemaphoreGive(g_pageCachedSem);
+    parser.close();
   }
 
-  int total = g_pagesBuilt.load(std::memory_order_relaxed);
-  writer.finish(static_cast<uint32_t>(total));
-  g_totalPages = total;
+  writer.finish(pageNum);
+  g_totalPages = pageNum;
   g_buildDone.store(true, std::memory_order_release);
-  xSemaphoreGive(g_pageCachedSem);   // wake Core 0 in case it's still waiting
-  parser.close();
-  Serial.printf("[Core1] Cache complete: %d pages.\n", total);
+  xSemaphoreGive(g_pageCachedSem);
+  Serial.printf("[Core1] Cache complete: %d pages.\n", pageNum);
   vTaskDelete(nullptr);
 }
 
 // ---------------------------------------------------------------------------
 // Slot helpers (read mode)
 // ---------------------------------------------------------------------------
-// Load a page from SD cache into a PSRAM slot.
-// Caller must hold g_sdMutex.
 static bool loadSlot(int slot, int pageIdx) {
   if (pageIdx < 0 || pageIdx >= g_totalPages) return false;
   uint8_t* buf = const_cast<uint8_t*>(g_pool.slotBuf(slot));
   if (!buf) return false;
-  bool ok = CacheReader::loadPage(pageIdx, buf);
+  bool ok = CacheReader::loadPage(g_currentBook->cacheDir, pageIdx, buf);
   if (ok) {
     g_slotPage[slot]  = pageIdx;
     g_slotValid[slot] = true;
@@ -227,45 +162,23 @@ static bool loadSlot(int slot, int pageIdx) {
   return ok;
 }
 
-// ---------------------------------------------------------------------------
-// showSlot — push a PSRAM slot to the e-ink panel.
-//
-// The GD7965 partial waveform does not fully drive pixels to their extreme
-// black/white states — it only nudges them toward the target.  After ~5
-// partial refreshes the particles drift enough to cause visible fading,
-// ghost lines, and broken text (the "page 6 corruption" symptom).
-//
-// The industry-standard fix (used by Kindle, Kobo, etc.) is a periodic
-// full refresh ("global update") every N pages.  A full refresh slams all
-// pixels back to clean, well-defined states and eliminates the drift.
-//
-// PARTIAL_REFRESH_MAX  — number of partial refreshes between full refreshes.
-//   5 = safe default; increase to 7-10 if you prefer fewer pauses and can
-//       tolerate slightly more ghosting.
-// ---------------------------------------------------------------------------
-#define PARTIAL_REFRESH_MAX  5
-
+#define PARTIAL_REFRESH_MAX 5
 static bool g_firstShow     = true;
-static int  g_partialCount  = 0;   // partials since last full refresh
+static int  g_partialCount  = 0;
 
 static void showSlot(int slot) {
   if (!g_pool.slotBuf(slot)) return;
-
   bool doFull = g_firstShow || (g_partialCount >= PARTIAL_REFRESH_MAX);
-
   if (doFull) {
     g_firstShow    = false;
     g_partialCount = 0;
-    renderer.showPageFull(slot);    // ~3.7 s — resets pixel states
+    renderer.showPageFull(slot);
   } else {
     ++g_partialCount;
-    renderer.showPagePartial(slot); // ~1.6 s — fast differential update
+    renderer.showPagePartial(slot);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Slot rotation helpers
-// ---------------------------------------------------------------------------
 static void rotateFwd() {
   int freed    = g_role[PREV];
   g_role[PREV] = g_role[CUR];
@@ -280,7 +193,6 @@ static void rotateBwd() {
   g_role[NEXT] = g_role[CUR];
   g_role[CUR]  = g_role[PREV];
   g_role[PREV] = stale;
-  // stale slot remains valid — it will be recycled on next forward nav
 }
 
 // ---------------------------------------------------------------------------
@@ -303,28 +215,19 @@ static void showProgress(int built, int /*total*/) {
   } while (display.nextPage());
 }
 
-// ---------------------------------------------------------------------------
-// Cache build monitor — runs on Core 0 during build phase.
-// Shows progress, then exits when g_buildDone is set.
-// ---------------------------------------------------------------------------
 static void runCacheBuildMonitor() {
   int lastShown = -1;
   while (true) {
-    // Wait for Core 1 to signal a page is done
     xSemaphoreTake(g_pageCachedSem, portMAX_DELAY);
-
     if (g_buildDone.load(std::memory_order_acquire)) break;
-
     int built = g_pagesBuilt.load(std::memory_order_acquire);
     if (built != lastShown) {
       lastShown = built;
-      // Show progress (takes g_sdMutex internally via display)
       xSemaphoreTake(g_sdMutex, portMAX_DELAY);
       showProgress(built, 0);
       xSemaphoreGive(g_sdMutex);
     }
   }
-  // Drain any remaining semaphore tokens
   while (xSemaphoreTake(g_pageCachedSem, 0) == pdTRUE) {}
   Serial.println("[Core0] Cache build complete.");
 }
@@ -332,17 +235,18 @@ static void runCacheBuildMonitor() {
 // ---------------------------------------------------------------------------
 // displayTask — Core 0, read mode
 // ---------------------------------------------------------------------------
-#define DISPLAY_STACK 8192
-
 static void displayTask(void* /*param*/) {
+  g_firstShow = true;
+  g_partialCount = 0;
 
-  // Pre-load slots: PREV (n/a on page 0), CUR=page0, NEXT=page1
+  g_role[PREV] = 0; g_role[CUR] = 1; g_role[NEXT] = 2;
+  for(int i=0; i<3; i++) { g_slotPage[i] = -1; g_slotValid[i] = false; }
+
   xSemaphoreTake(g_sdMutex, portMAX_DELAY);
   loadSlot(g_role[CUR],  0);
   if (g_totalPages > 1) loadSlot(g_role[NEXT], 1);
   xSemaphoreGive(g_sdMutex);
 
-  // Show page 0 with FULL refresh (required for first display)
   xSemaphoreTake(g_sdMutex, portMAX_DELAY);
   showSlot(g_role[CUR]);
   xSemaphoreGive(g_sdMutex);
@@ -352,49 +256,35 @@ static void displayTask(void* /*param*/) {
   for (;;) {
     if (xQueueReceive(g_navQueue, &cmd, portMAX_DELAY) != pdTRUE) continue;
 
-    // ------- NEXT -------
     if (cmd == NAV_NEXT) {
       int curPage = g_slotPage[g_role[CUR]];
-      if (curPage >= g_totalPages - 1) {
-        Serial.println("[Display] Last page.");
-        continue;
-      }
+      if (curPage >= g_totalPages - 1) continue;
 
-      // Is NEXT slot pre-loaded?
-      if (!g_slotValid[g_role[NEXT]]) {
-        // Load it now (shouldn't normally happen — we pre-load in the loop)
+      bool nextReady = g_slotValid[g_role[NEXT]] && (g_slotPage[g_role[NEXT]] == curPage + 1);
+      if (!nextReady) {
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
         loadSlot(g_role[NEXT], curPage + 1);
         xSemaphoreGive(g_sdMutex);
       }
 
-      // Show NEXT page
       xSemaphoreTake(g_sdMutex, portMAX_DELAY);
       showSlot(g_role[NEXT]);
       xSemaphoreGive(g_sdMutex);
-      Serial.printf("[Display] Page %d (partial).\n", g_slotPage[g_role[NEXT]] + 1);
 
       rotateFwd();
 
-      // Pre-load the new NEXT slot (page after current)
       int newNextPage = g_slotPage[g_role[CUR]] + 1;
       if (newNextPage < g_totalPages) {
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
         loadSlot(g_role[NEXT], newNextPage);
         xSemaphoreGive(g_sdMutex);
       }
-    }
-
-    // ------- PREV -------
-    else {
+    } else {
       int curPage = g_slotPage[g_role[CUR]];
-      if (curPage <= 0) {
-        Serial.println("[Display] First page.");
-        continue;
-      }
+      if (curPage <= 0) continue;
 
-      // Is PREV slot valid?
-      if (!g_slotValid[g_role[PREV]]) {
+      bool prevReady = g_slotValid[g_role[PREV]] && (g_slotPage[g_role[PREV]] == curPage - 1);
+      if (!prevReady) {
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
         loadSlot(g_role[PREV], curPage - 1);
         xSemaphoreGive(g_sdMutex);
@@ -403,11 +293,12 @@ static void displayTask(void* /*param*/) {
       xSemaphoreTake(g_sdMutex, portMAX_DELAY);
       showSlot(g_role[PREV]);
       xSemaphoreGive(g_sdMutex);
-      Serial.printf("[Display] Page %d (partial, back).\n", g_slotPage[g_role[PREV]] + 1);
 
       rotateBwd();
 
-      // Pre-load the new PREV slot
+      g_slotValid[g_role[PREV]] = false;
+      g_slotPage [g_role[PREV]] = -1;
+
       int newPrevPage = g_slotPage[g_role[CUR]] - 1;
       if (newPrevPage >= 0) {
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
@@ -419,12 +310,110 @@ static void displayTask(void* /*param*/) {
 }
 
 // ---------------------------------------------------------------------------
-// Buttons
+// Menu rendering
+// ---------------------------------------------------------------------------
+static void showMenu() {
+  xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    display.setFont(nullptr);
+    display.setCursor(10, 20);
+    display.print("Select Book:");
+
+    for (int i=0; i<g_numBooks; i++) {
+      display.setCursor(20, 60 + i*30);
+      if (i == g_selectedBookIdx) {
+        display.print("> ");
+      } else {
+        display.print("  ");
+      }
+      display.print(g_books[i].name);
+    }
+  } while (display.nextPage());
+  xSemaphoreGive(g_sdMutex);
+}
+
+// ---------------------------------------------------------------------------
+// Status screen
+// ---------------------------------------------------------------------------
+static void showStatus(const char* l1, const char* l2 = nullptr) {
+  if(g_sdMutex) xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setFont(nullptr);
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(10, display.height() / 2 - 10);
+    display.print(l1);
+    if (l2) { display.setCursor(10, display.height() / 2 + 10); display.print(l2); }
+  } while (display.nextPage());
+  if(g_sdMutex) xSemaphoreGive(g_sdMutex);
+}
+
+// ---------------------------------------------------------------------------
+// Start Book Process
+// ---------------------------------------------------------------------------
+static void startBook(int idx) {
+  g_currentBook = &g_books[idx];
+  
+  uint32_t totalSize = 0;
+  for (int i=0; i<g_currentBook->xhtmlCount; i++) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s%s", g_currentBook->basePath, g_currentBook->xhtmlFiles[i]);
+    File f = SD.open(path);
+    if (f) {
+      totalSize += f.size();
+      f.close();
+    }
+  }
+  g_totalSourceSize = totalSize;
+
+  CacheMeta meta;
+  bool cacheValid = CacheReader::probe(g_currentBook->cacheDir, g_totalSourceSize, meta);
+
+  if (!cacheValid) {
+    g_appState = STATE_CACHE_BUILD;
+    Serial.println("Cache stale/missing. Building...");
+    showStatus("Building cache...", g_currentBook->name);
+
+    g_pagesBuilt.store(0);
+    g_buildDone.store(false);
+
+    xTaskCreatePinnedToCore(cacheBuildTask, "CacheBuild", 8192, nullptr, 1, nullptr, 1);
+    runCacheBuildMonitor();
+    
+    CacheReader::probe(g_currentBook->cacheDir, g_totalSourceSize, meta);
+  }
+
+  g_totalPages = static_cast<int>(meta.pageCount);
+  Serial.printf("Cache ready: %d pages.\n", g_totalPages);
+
+  if (g_totalPages <= 0) {
+    showStatus("No pages found!");
+    g_appState = STATE_BOOK_SELECT;
+    return;
+  }
+
+  g_appState = STATE_READ;
+  showStatus("Loading...", "Please wait");
+
+  xTaskCreatePinnedToCore(displayTask, "Display", 8192, &g_displayTaskHandle, 2, nullptr, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Buttons & loop
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_btnNextPending{false};
 static std::atomic<bool> g_btnPrevPending{false};
+static std::atomic<bool> g_btnSelectPending{false};
+
 static volatile int64_t  g_btnNextTime = 0;
 static volatile int64_t  g_btnPrevTime = 0;
+static volatile int64_t  g_btnSelectTime = 0;
 #define DEBOUNCE_US 50000LL
 
 void IRAM_ATTR onBtnNext() {
@@ -441,69 +430,59 @@ void IRAM_ATTR onBtnPrev() {
     g_btnPrevPending.store(true, std::memory_order_relaxed);
   }
 }
+void IRAM_ATTR onBtnSelect() {
+  int64_t now = esp_timer_get_time();
+  if (now - g_btnSelectTime >= DEBOUNCE_US) {
+    g_btnSelectTime = now;
+    g_btnSelectPending.store(true, std::memory_order_relaxed);
+  }
+}
 
 void loop() {
-  // ---- Button handling -------------------------------------------------------
   if (g_btnNextPending.load(std::memory_order_relaxed)) {
     g_btnNextPending.store(false, std::memory_order_relaxed);
     if (digitalRead(BTN_NEXT) == LOW) {
-      NavCmd c = NAV_NEXT;
-      xQueueSend(g_navQueue, &c, 0);
-    }
-  }
-  if (g_btnPrevPending.load(std::memory_order_relaxed)) {
-    g_btnPrevPending.store(false, std::memory_order_relaxed);
-    if (digitalRead(BTN_PREV) == LOW) {
-      NavCmd c = NAV_PREV;
-      xQueueSend(g_navQueue, &c, 0);
+      if (g_appState == STATE_BOOK_SELECT) {
+        g_selectedBookIdx = (g_selectedBookIdx + 1) % g_numBooks;
+        showMenu();
+      } else if (g_appState == STATE_READ) {
+        NavCmd c = NAV_NEXT;
+        xQueueSend(g_navQueue, &c, 0);
+      }
     }
   }
 
-  // ---- Serial command handler ------------------------------------------------
-  // Used by the "clear_cache" PlatformIO target (tools/clear_cache.py).
-  // Send  "!CLEARCACHE\n"  over serial to wipe /cache/meta.bin and restart,
-  // forcing a full re-render on the next boot.
-  static char    s_serialBuf[16];
-  static uint8_t s_serialIdx = 0;
-  while (Serial.available()) {
-    char ch = static_cast<char>(Serial.read());
-    if (ch == '\n' || ch == '\r') {
-      s_serialBuf[s_serialIdx] = '\0';
-      if (strcmp(s_serialBuf, "!CLEARCACHE") == 0) {
-        Serial.println("[Cache] Deleting /cache/meta.bin ...");
-        if (g_sdMutex) xSemaphoreTake(g_sdMutex, portMAX_DELAY);
-        bool ok = SD.remove(CACHE_META_PATH);
-        if (g_sdMutex) xSemaphoreGive(g_sdMutex);
-        if (ok) Serial.println("[Cache] Deleted. Restarting...");
-        else    Serial.println("[Cache] Already clear. Restarting...");
-        delay(200);
-        ESP.restart();
+  if (g_btnPrevPending.load(std::memory_order_relaxed)) {
+    g_btnPrevPending.store(false, std::memory_order_relaxed);
+    if (digitalRead(BTN_PREV) == LOW) {
+      if (g_appState == STATE_BOOK_SELECT) {
+        g_selectedBookIdx = (g_selectedBookIdx - 1 + g_numBooks) % g_numBooks;
+        showMenu();
+      } else if (g_appState == STATE_READ) {
+        NavCmd c = NAV_PREV;
+        xQueueSend(g_navQueue, &c, 0);
       }
-      s_serialIdx = 0;
-    } else {
-      if (s_serialIdx < sizeof(s_serialBuf) - 1)
-        s_serialBuf[s_serialIdx++] = ch;
+    }
+  }
+
+  if (g_btnSelectPending.load(std::memory_order_relaxed)) {
+    g_btnSelectPending.store(false, std::memory_order_relaxed);
+    if (digitalRead(BTN_SELECT) == LOW) {
+      if (g_appState == STATE_BOOK_SELECT) {
+        startBook(g_selectedBookIdx);
+      } else if (g_appState == STATE_READ) {
+        // Optional: Return to menu
+        if (g_displayTaskHandle) {
+          vTaskDelete(g_displayTaskHandle);
+          g_displayTaskHandle = nullptr;
+        }
+        g_appState = STATE_BOOK_SELECT;
+        showMenu();
+      }
     }
   }
 
   vTaskDelay(pdMS_TO_TICKS(5));
-}
-
-
-// ---------------------------------------------------------------------------
-// Status screen
-// ---------------------------------------------------------------------------
-static void showStatus(const char* l1, const char* l2 = nullptr) {
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setFont(nullptr);
-    display.setTextColor(GxEPD_BLACK);
-    display.setCursor(10, display.height() / 2 - 10);
-    display.print(l1);
-    if (l2) { display.setCursor(10, display.height() / 2 + 10); display.print(l2); }
-  } while (display.nextPage());
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +498,7 @@ void setup() {
   pinMode(BTN_SELECT, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BTN_NEXT), onBtnNext, FALLING);
   attachInterrupt(digitalPinToInterrupt(BTN_PREV), onBtnPrev, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_SELECT), onBtnSelect, FALLING);
 
   display.init(115200);
   display.setRotation(1);
@@ -545,41 +525,14 @@ void setup() {
   }
   renderer.setSdMutex(g_sdMutex);
 
-  // -----------------------------------------------------------------------
-  // Check cache
-  // -----------------------------------------------------------------------
-  CacheMeta meta;
-  bool cacheValid = CacheReader::probe(meta);
-
-  if (!cacheValid) {
-    // ---- CACHE BUILD MODE ----
-    Serial.println("Cache stale/missing. Building...");
-    showStatus("Building cache...", "First boot only");
-
-    // Launch Core 1 render+cache task
-    xTaskCreatePinnedToCore(cacheBuildTask, "CacheBuild", 8192,
-                            nullptr, 1, nullptr, 1);
-
-    // Core 0 shows progress until build is done
-    runCacheBuildMonitor();
-
-    // Re-read metadata now that build is complete
-    CacheReader::probe(meta);
-  }
-
-  g_totalPages = static_cast<int>(meta.pageCount);
-  Serial.printf("Cache ready: %d pages.\n", g_totalPages);
-
-  if (g_totalPages <= 0) {
-    showStatus("No pages found!");
+  // Discover books
+  g_numBooks = BookScanner::scan(g_books, MAX_BOOKS);
+  if (g_numBooks <= 0) {
+    showStatus("No books found in /books/");
     return;
   }
 
-  // -----------------------------------------------------------------------
-  // READ MODE — launch display task
-  // -----------------------------------------------------------------------
-  showStatus("Loading...", "Please wait");
-
-  xTaskCreatePinnedToCore(displayTask, "Display", DISPLAY_STACK,
-                          nullptr, 2, nullptr, 0);
+  g_appState = STATE_BOOK_SELECT;
+  g_selectedBookIdx = 0;
+  showMenu();
 }
