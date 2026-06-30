@@ -62,7 +62,7 @@ public:
   }
 
   bool writePage(int idx, const uint8_t* buf) {
-    char path[80];
+    char path[256];
     cachePagePath(_cacheDir, idx, path, sizeof(path));
     // Remove stale file if it exists
     if (SD.exists(path)) SD.remove(path);
@@ -71,13 +71,14 @@ public:
       Serial.printf("[Cache] Cannot write %s\n", path);
       return false;
     }
+
     size_t written = f.write(buf, FB_SIZE);
     f.close();
     return written == FB_SIZE;
   }
 
   bool finish(uint32_t pageCount) {
-    char metaPath[80];
+    char metaPath[256];
     snprintf(metaPath, sizeof(metaPath), "%s/meta.bin", _cacheDir);
 
     // Write metadata last — presence of meta.bin signals a complete cache
@@ -95,7 +96,7 @@ public:
   }
 
 private:
-  char     _cacheDir[64];
+  char     _cacheDir[128];
   uint32_t _sourceSize = 0;
 };
 
@@ -108,7 +109,7 @@ public:
   // Check whether a valid, up-to-date cache exists for this book.
   // Returns true and fills meta if valid; false otherwise.
   static bool probe(const char* cacheDir, uint32_t actualTotalSize, CacheMeta& meta) {
-    char metaPath[80];
+    char metaPath[256];
     snprintf(metaPath, sizeof(metaPath), "%s/meta.bin", cacheDir);
 
     File f = SD.open(metaPath);
@@ -126,10 +127,11 @@ public:
   // Load page `idx` into `buf` (must be FB_SIZE bytes).
   // Returns true on success.
   static bool loadPage(const char* cacheDir, int idx, uint8_t* buf) {
-    char path[80];
+    char path[256];
     cachePagePath(cacheDir, idx, path, sizeof(path));
     File f = SD.open(path);
     if (!f) { Serial.printf("[Cache] Missing %s\n", path); return false; }
+    
     size_t got = f.read(buf, FB_SIZE);
     f.close();
     return got == FB_SIZE;

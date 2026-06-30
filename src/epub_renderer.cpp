@@ -1,6 +1,12 @@
 #include "epub_renderer.h"
 #include <string.h>
 
+// Cache_WriteBack_Addr: flush dirty CPU D-cache lines to physical PSRAM.
+// Must be called before any SPI/DMA transfer that reads from a PSRAM buffer
+// written by the CPU, otherwise the DMA sees stale (old-page) data.
+// This is a ROM function, always available on all ESP32-S3 IDF versions.
+extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
+
 EpubRenderer* EpubRenderer::s_instance = nullptr;
 
 // ===========================================================================
@@ -27,21 +33,35 @@ int EpubRenderer::s_pngDraw(PNGDRAW* pDraw) {
 }
 
 void EpubRenderer::pngRowDraw(PNGDRAW* pDraw) {
-  _png.getLineAsRGB565(pDraw, _lineBuffer, PNG_RGB565_LITTLE_ENDIAN, 0xffffffffu);
+  uint16_t* buf = _lineBuffer;
+  bool dynamicBuf = false;
+  if (pDraw->iWidth > DISPLAY_W) {
+    buf = static_cast<uint16_t*>(heap_caps_malloc(pDraw->iWidth * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!buf) return; // If allocation fails, skip this row to avoid crash
+    dynamicBuf = true;
+  }
+
+  _png.getLineAsRGB565(pDraw, buf, PNG_RGB565_LITTLE_ENDIAN, 0xffffffffu);
   int16_t py = _imgDestY + static_cast<int16_t>(pDraw->y);
-  if (py < 0 || py >= DISPLAY_H) return;
-  for (int x = 0; x < pDraw->iWidth; ++x) {
-    int16_t px = _imgDestX + static_cast<int16_t>(x);
-    if (px < 0 || px >= DISPLAY_W) continue;
-    uint16_t p  = _lineBuffer[x];
-    uint8_t  r8 = static_cast<uint8_t>(((p >> 11) & 0x1F) << 3);
-    uint8_t  g8 = static_cast<uint8_t>(((p >>  5) & 0x3F) << 2);
-    uint8_t  b8 = static_cast<uint8_t>(( p        & 0x1F) << 3);
-    uint16_t luma = static_cast<uint16_t>(
-      (static_cast<uint32_t>(r8) * 299 +
-       static_cast<uint32_t>(g8) * 587 +
-       static_cast<uint32_t>(b8) * 114) / 1000);
-    g_pool.drawPixel(px, py, luma < 180 ? 0 : 1);
+  if (py >= 0 && py < DISPLAY_H) {
+    int maxCols = pDraw->iWidth < DISPLAY_W ? pDraw->iWidth : DISPLAY_W;
+    for (int x = 0; x < maxCols; ++x) {
+      int16_t px = _imgDestX + static_cast<int16_t>(x);
+      if (px < 0 || px >= DISPLAY_W) continue;
+      uint16_t p  = buf[x];
+      uint8_t  r8 = static_cast<uint8_t>(((p >> 11) & 0x1F) << 3);
+      uint8_t  g8 = static_cast<uint8_t>(((p >>  5) & 0x3F) << 2);
+      uint8_t  b8 = static_cast<uint8_t>(( p        & 0x1F) << 3);
+      uint16_t luma = static_cast<uint16_t>(
+        (static_cast<uint32_t>(r8) * 299 +
+         static_cast<uint32_t>(g8) * 587 +
+         static_cast<uint32_t>(b8) * 114) / 1000);
+      g_pool.drawPixel(px, py, luma < 180 ? 0 : 1);
+    }
+  }
+
+  if (dynamicBuf) {
+    free(buf);
   }
 }
 
@@ -862,8 +882,11 @@ static const uint8_t* portraitToNative(const uint8_t* portrait) {
   if (!portrait) return nullptr;
   if (!s_nativeBuf) {
     s_nativeBuf = static_cast<uint8_t*>(
-      heap_caps_malloc(FB_SIZE, MALLOC_CAP_SPIRAM));
-    if (!s_nativeBuf) return nullptr;
+      heap_caps_aligned_alloc(64, DISPLAY_W * DISPLAY_H / 2, MALLOC_CAP_SPIRAM));
+    if (!s_nativeBuf) {
+      Serial.println("[Renderer] ERROR: Failed to allocate s_nativeBuf in internal RAM!");
+      return nullptr;
+    }
   }
 
   constexpr int16_t panelW      = GxEPD2_750_T7::WIDTH;   // 800
@@ -893,6 +916,8 @@ void EpubRenderer::showPageFull(int slot) {
   const uint8_t* buf    = g_pool.slotBuf(slot);
   const uint8_t* native = portraitToNative(buf);
   if (!native) return;
+  // Flush CPU D-cache → physical PSRAM before SPI reads it for the display transfer.
+  Cache_WriteBack_Addr(reinterpret_cast<uint32_t>(native), FB_SIZE);
   _disp.writeImage(native, 0, 0,
                    GxEPD2_750_T7::WIDTH, GxEPD2_750_T7::HEIGHT,
                    false, false, false);
@@ -909,6 +934,8 @@ void EpubRenderer::showPagePartial(int slot) {
   const uint8_t* buf    = g_pool.slotBuf(slot);
   const uint8_t* native = portraitToNative(buf);
   if (!native) return;
+  // Flush CPU D-cache → physical PSRAM before SPI reads it for the display transfer.
+  Cache_WriteBack_Addr(reinterpret_cast<uint32_t>(native), FB_SIZE);
   _disp.writeImage(native, 0, 0,
                    GxEPD2_750_T7::WIDTH, GxEPD2_750_T7::HEIGHT,
                    false, false, false);
