@@ -23,6 +23,9 @@
 #include <SD.h>
 #include "framebuffer.h"   // for FB_SIZE, FB_STRIDE
 
+// ESP32-S3 ROM function for flushing D-cache to physical PSRAM
+extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
+
 #define CACHE_MAGIC        0x45504743u   // 'EPGC' — bump version to invalidate old cache
 
 struct CacheMeta {
@@ -71,6 +74,10 @@ public:
       Serial.printf("[Cache] Cannot write %s\n", path);
       return false;
     }
+
+    // Flush CPU D-cache to physical PSRAM before SD write (ESP32-S3 CRITICAL)
+    // Without this, SD card may receive stale cached data instead of actual rendered pixels
+    Cache_WriteBack_Addr(reinterpret_cast<uint32_t>(buf), FB_SIZE);
 
     size_t written = f.write(buf, FB_SIZE);
     f.close();

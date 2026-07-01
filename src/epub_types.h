@@ -5,7 +5,7 @@
 // Buffer sizes
 // ---------------------------------------------------------------------------
 #define MAX_TEXT_LEN   256   // larger to hold table cell text + embedded image sentinels
-#define MAX_PATH_LEN    96   // larger for deeper book directory structures
+#define MAX_PATH_LEN   192   // increased for long formula hash filenames (was 96, causing truncation)
 
 // ---------------------------------------------------------------------------
 // Display dimensions (portrait, rotation=1)

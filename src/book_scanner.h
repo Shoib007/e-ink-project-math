@@ -30,7 +30,7 @@
 
 struct BookInfo {
   char name     [32];                       // directory name (display label)
-  char basePath [72];                       // e.g. /books/jemh1a2/OEBPS/
+  char basePath [128];                      // e.g. /books/jemh1a2/OEBPS/ (increased for long book names)
   char cacheDir [64];                       // e.g. /cache/jemh1a2
   char xhtmlFiles[MAX_XHTML_FILES][48];    // ordered XHTML filenames (not full paths)
   int  xhtmlCount;

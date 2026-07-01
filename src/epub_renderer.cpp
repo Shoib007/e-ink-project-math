@@ -37,26 +37,85 @@ void EpubRenderer::pngRowDraw(PNGDRAW* pDraw) {
   bool dynamicBuf = false;
   if (pDraw->iWidth > DISPLAY_W) {
     buf = static_cast<uint16_t*>(heap_caps_malloc(pDraw->iWidth * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (!buf) return; // If allocation fails, skip this row to avoid crash
+    if (!buf) return;
     dynamicBuf = true;
   }
 
-  _png.getLineAsRGB565(pDraw, buf, PNG_RGB565_LITTLE_ENDIAN, 0xffffffffu);
-  int16_t py = _imgDestY + static_cast<int16_t>(pDraw->y);
-  if (py >= 0 && py < DISPLAY_H) {
-    int maxCols = pDraw->iWidth < DISPLAY_W ? pDraw->iWidth : DISPLAY_W;
-    for (int x = 0; x < maxCols; ++x) {
-      int16_t px = _imgDestX + static_cast<int16_t>(x);
-      if (px < 0 || px >= DISPLAY_W) continue;
-      uint16_t p  = buf[x];
-      uint8_t  r8 = static_cast<uint8_t>(((p >> 11) & 0x1F) << 3);
-      uint8_t  g8 = static_cast<uint8_t>(((p >>  5) & 0x3F) << 2);
-      uint8_t  b8 = static_cast<uint8_t>(( p        & 0x1F) << 3);
-      uint16_t luma = static_cast<uint16_t>(
-        (static_cast<uint32_t>(r8) * 299 +
-         static_cast<uint32_t>(g8) * 587 +
-         static_cast<uint32_t>(b8) * 114) / 1000);
-      g_pool.drawPixel(px, py, luma < 180 ? 0 : 1);
+  // Debug: print first row info
+  if (pDraw->y == 0) {
+    Serial.printf("[PNG] width=%d pixelType=%d hasAlpha=%d scale=%.2f\n", 
+                  pDraw->iWidth, pDraw->iPixelType, pDraw->iHasAlpha, _inlineImgScale);
+  }
+
+  _png.getLineAsRGB565(pDraw, buf, PNG_RGB565_LITTLE_ENDIAN, 0xFFFF);  // Use RGB565 white (0xFFFF) for transparent pixels
+  
+  // Handle scaling for inline images
+  if (_inlineImgScale < 1.0f) {
+    // Downsampling mode: only render rows that map to scaled output
+    int scaledRow = static_cast<int>(static_cast<float>(pDraw->y) * _inlineImgScale);
+    if (scaledRow >= static_cast<int>(_inlineImgScaledH)) {
+      if (dynamicBuf) free(buf);
+      return;  // Skip rows beyond scaled height
+    }
+    
+    int16_t py = _inlineImgDestY + scaledRow;
+    if (py >= 0 && py < DISPLAY_H) {
+      // Sample pixels with nearest-neighbor
+      for (uint16_t sx = 0; sx < _inlineImgScaledW; ++sx) {
+        int srcX = static_cast<int>(static_cast<float>(sx) / _inlineImgScale);
+        if (srcX >= pDraw->iWidth) srcX = pDraw->iWidth - 1;
+        
+        int16_t px = _inlineImgDestX + static_cast<int16_t>(sx);
+        if (px < 0 || px >= DISPLAY_W) continue;
+        
+        uint16_t p  = buf[srcX];
+        
+        // Skip white/near-white pixels (transparent background)
+        // Only draw the actual dark formula content
+        if (p >= 0xF7DE) continue;  // Skip if RGB565 >= (248,252,248) - very light pixels
+        
+        uint8_t  r8 = static_cast<uint8_t>(((p >> 11) & 0x1F) << 3);
+        uint8_t  g8 = static_cast<uint8_t>(((p >>  5) & 0x3F) << 2);
+        uint8_t  b8 = static_cast<uint8_t>(( p        & 0x1F) << 3);
+        uint16_t luma = static_cast<uint16_t>(
+          (static_cast<uint32_t>(r8) * 299 +
+           static_cast<uint32_t>(g8) * 587 +
+           static_cast<uint32_t>(b8) * 114) / 1000);
+        
+        // Only draw dark pixels (the formula itself), skip light background
+        if (luma >= 240) continue;
+        
+        g_pool.drawPixel(px, py, luma < 128 ? 0 : 1);
+      }
+    }
+  } else {
+    // No scaling - render at original size
+    int16_t py = _imgDestY + static_cast<int16_t>(pDraw->y);
+    if (py >= 0 && py < DISPLAY_H) {
+      int maxCols = pDraw->iWidth < DISPLAY_W ? pDraw->iWidth : DISPLAY_W;
+      for (int x = 0; x < maxCols; ++x) {
+        int16_t px = _imgDestX + static_cast<int16_t>(x);
+        if (px < 0 || px >= DISPLAY_W) continue;
+        
+        uint16_t p  = buf[x];
+        
+        // Skip white/near-white pixels (transparent background)
+        // Only draw the actual dark content
+        if (p >= 0xF7DE) continue;  // Skip if RGB565 >= (248,252,248) - very light pixels
+        
+        uint8_t  r8 = static_cast<uint8_t>(((p >> 11) & 0x1F) << 3);
+        uint8_t  g8 = static_cast<uint8_t>(((p >>  5) & 0x3F) << 2);
+        uint8_t  b8 = static_cast<uint8_t>(( p        & 0x1F) << 3);
+        uint16_t luma = static_cast<uint16_t>(
+          (static_cast<uint32_t>(r8) * 299 +
+           static_cast<uint32_t>(g8) * 587 +
+           static_cast<uint32_t>(b8) * 114) / 1000);
+        
+        // Only draw dark pixels, skip light background
+        if (luma >= 240) continue;
+        
+        g_pool.drawPixel(px, py, luma < 128 ? 0 : 1);
+      }
     }
   }
 
@@ -354,33 +413,55 @@ void EpubRenderer::renderInlineImage(const char* path) {
   if (!decodePng(path, 0, 0, imgW, imgH, true)) return;
   if (imgW == 0 || imgH == 0) return;
 
+  // Calculate target height: match typical body text height (~18px)
+  // This makes formulas integrate naturally with surrounding text
+  const uint16_t TARGET_HEIGHT = 18;
+  float scale = 1.0f;
+  uint16_t scaledW = imgW;
+  uint16_t scaledH = imgH;
+  
+  if (imgH > TARGET_HEIGHT) {
+    scale = static_cast<float>(TARGET_HEIGHT) / static_cast<float>(imgH);
+    scaledW = static_cast<uint16_t>(static_cast<float>(imgW) * scale);
+    scaledH = TARGET_HEIGHT;
+    Serial.printf("[PNG] Scaling inline image from %ux%u to %ux%u (scale=%.2f)\n", 
+                  imgW, imgH, scaledW, scaledH, scale);
+  }
+
   // Add pre-image space if something is already on this line
   if (_lineHasContent) _cx += INLINE_IMG_SPACE;
 
-  // Wrap if image won't fit on this line
-  if (_cx > _wrapLeftMargin && _cx + static_cast<int16_t>(imgW) > _rightBound) {
+  // Wrap if scaled image won't fit on this line
+  if (_cx > _wrapLeftMargin && _cx + static_cast<int16_t>(scaledW) > _rightBound) {
     newLine();
     if (_pageFull) return;
   }
 
-  // Vertical placement:
-  //   The formula PNG bottom is placed at (baseline + INLINE_IMG_DESCENT)
-  //   so the visual math baseline aligns with the text baseline.
+  // Vertical placement with scaled height
   int16_t destX = _cx;
-  int16_t destY = _cy - static_cast<int16_t>(imgH) + INLINE_IMG_DESCENT;
+  int16_t destY = _cy - static_cast<int16_t>(scaledH) + INLINE_IMG_DESCENT;
   if (destY < 0) destY = 0;
 
   checkPageOverflow(0);
   if (_pageFull) return;
 
-  // Decode and draw
+  // Store scale info for pngRowDraw to use during decode
+  _inlineImgScale = scale;
+  _inlineImgDestX = destX;
+  _inlineImgDestY = destY;
+  _inlineImgScaledW = scaledW;
+  _inlineImgScaledH = scaledH;
+  
+  // Decode - pngRowDraw will handle downsampling
   decodePng(path, destX, destY, imgW, imgH, false);
+  
+  _inlineImgScale = 1.0f;  // Reset
 
-  // Advance cursor; add post-image space so the next word has breathing room
-  _cx += static_cast<int16_t>(imgW) + INLINE_IMG_SPACE;
+  // Advance cursor using scaled width
+  _cx += static_cast<int16_t>(scaledW) + INLINE_IMG_SPACE;
 
-  // Line height: image spans (imgH - INLINE_IMG_DESCENT) above baseline
-  int16_t imgAscent = static_cast<int16_t>(imgH) - INLINE_IMG_DESCENT;
+  // Line height using scaled height
+  int16_t imgAscent = static_cast<int16_t>(scaledH) - INLINE_IMG_DESCENT;
   if (imgAscent > _lineH) _lineH = imgAscent;
   _lineHasContent = true;
 }
