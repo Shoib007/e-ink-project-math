@@ -579,6 +579,11 @@ void setup() {
   // READ MODE — launch display task
   // -----------------------------------------------------------------------
   showStatus("Loading...", "Please wait");
+  
+  // Re-initialize display to clear GxEPD2 state machine and controller SRAM
+  // after the high-level progress screens, before switching to low-level APIs.
+  display.hibernate();
+  display.init(115200);
 
   xTaskCreatePinnedToCore(displayTask, "Display", DISPLAY_STACK,
                           nullptr, 2, nullptr, 0);

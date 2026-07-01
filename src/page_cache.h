@@ -30,8 +30,8 @@
 // Source XHTML path — used for staleness check and as the entry point for rendering.
 // EPUB_BASE_PATH is prepended to every relative image path found in the XHTML.
 // Change BOTH constants when switching books; no other source file needs editing.
-#define XHTML_PATH         "/book3/EPUB/chap_01.xhtml"
-#define EPUB_BASE_PATH     "/book3/EPUB/"
+#define XHTML_PATH         "/books/jemh1a1/OEBPS/chapter_001.xhtml"
+#define EPUB_BASE_PATH     "/books/jemh1a1/OEBPS/"
 
 struct CacheMeta {
   uint32_t magic;
