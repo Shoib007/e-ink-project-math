@@ -29,6 +29,9 @@
 #include <SD.h>
 #include "framebuffer.h"   // for FB_SIZE, FB_STRIDE
 
+// ESP32-S3 ROM function for flushing D-cache to physical PSRAM
+extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
+
 #define CACHE_MAGIC        0x45504744u   // 'EPGD' — bumped to invalidate old per-file caches
 
 struct CacheMeta {

@@ -98,6 +98,13 @@ private:
   uint16_t _lineBuffer[DISPLAY_W];
   PNG      _png;
 
+  // Inline image scaling support
+  float    _inlineImgScale = 1.0f;
+  int16_t  _inlineImgDestX = 0;
+  int16_t  _inlineImgDestY = 0;
+  uint16_t _inlineImgScaledW = 0;
+  uint16_t _inlineImgScaledH = 0;
+
   // JPEG: track decoded extent for two-pass centering
   uint16_t _jpgImgW = 0;
   uint16_t _jpgImgH = 0;

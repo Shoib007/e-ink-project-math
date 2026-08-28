@@ -213,7 +213,7 @@ bool XhtmlParser::readText(char /*stopAt*/) {
 // Returns false when emit() returned false (page-full stop signal).
 // ===========================================================================
 bool XhtmlParser::processTag() {
-  char tag[512]; int ti = 0;
+  char tag[1024]; int ti = 0;  // Increased from 512 to 1024 for long image paths
   bool inStr = false; char strDelim = 0;
 
   while (true) {
@@ -426,6 +426,7 @@ bool XhtmlParser::processTag() {
     RenderElem e; memset(&e, 0, sizeof(e));
     e.type = imgType;
     snprintf(e.path, MAX_PATH_LEN, "%s%s", _basePath, src);
+    Serial.printf("[Parser] Image path: %s\n", e.path);  // DEBUG
     if (!emit(e)) return false;
   }
 

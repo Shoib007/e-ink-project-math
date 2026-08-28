@@ -68,6 +68,9 @@ static bool g_slotValid[3] = {false, false, false};
 
 static int  g_totalPages   = 0;
 
+// Manual full refresh trigger
+static std::atomic<bool> g_forceFullRefresh{false};
+
 // ---------------------------------------------------------------------------
 // Cache-build state (Core 1 render task)
 // ---------------------------------------------------------------------------
@@ -162,12 +165,23 @@ static bool loadSlot(int slot, int pageIdx) {
   return ok;
 }
 
-#define PARTIAL_REFRESH_MAX 5
+#define PARTIAL_REFRESH_MAX 5  // Do full refresh every 5 pages to clear ghosting
 static bool g_firstShow     = true;
 static int  g_partialCount  = 0;
 
 static void showSlot(int slot) {
   if (!g_pool.slotBuf(slot)) return;
+  
+  // Force full refresh if requested (e.g., user held SELECT button)
+  bool forceFullRequested = g_forceFullRefresh.load(std::memory_order_relaxed);
+  if (forceFullRequested) {
+    g_forceFullRefresh.store(false, std::memory_order_relaxed);
+    g_partialCount = 0;
+    renderer.showPageFull(slot);
+    Serial.println("[Display] Manual full refresh triggered.");
+    return;
+  }
+  
   bool doFull = g_firstShow || (g_partialCount >= PARTIAL_REFRESH_MAX);
   if (doFull) {
     g_firstShow    = false;
@@ -419,7 +433,9 @@ static std::atomic<bool> g_btnSelectPending{false};
 static volatile int64_t  g_btnNextTime = 0;
 static volatile int64_t  g_btnPrevTime = 0;
 static volatile int64_t  g_btnSelectTime = 0;
+static volatile int64_t  g_btnSelectPressStart = 0;  // Track when SELECT was first pressed
 #define DEBOUNCE_US 50000LL
+#define LONG_PRESS_US 1000000LL  // 1 second for long press
 
 void IRAM_ATTR onBtnNext() {
   int64_t now = esp_timer_get_time();
@@ -439,6 +455,7 @@ void IRAM_ATTR onBtnSelect() {
   int64_t now = esp_timer_get_time();
   if (now - g_btnSelectTime >= DEBOUNCE_US) {
     g_btnSelectTime = now;
+    g_btnSelectPressStart = now;  // Track when button was first pressed
     g_btnSelectPending.store(true, std::memory_order_relaxed);
   }
 }
@@ -507,6 +524,7 @@ void loop() {
     }
   }
 
+  // Handle PREV button
   if (g_btnPrevPending.load(std::memory_order_relaxed)) {
     g_btnPrevPending.store(false, std::memory_order_relaxed);
     if (digitalRead(BTN_PREV) == LOW) {
@@ -520,20 +538,51 @@ void loop() {
     }
   }
 
+  // Handle SELECT button with long press detection
   if (g_btnSelectPending.load(std::memory_order_relaxed)) {
-    g_btnSelectPending.store(false, std::memory_order_relaxed);
+    // Wait a moment to check if it's a long press
+    delay(50);  // Debounce
+    
     if (digitalRead(BTN_SELECT) == LOW) {
-      if (g_appState == STATE_BOOK_SELECT) {
-        startBook(g_selectedBookIdx);
-      } else if (g_appState == STATE_READ) {
-        // Optional: Return to menu
-        if (g_displayTaskHandle) {
-          vTaskDelete(g_displayTaskHandle);
-          g_displayTaskHandle = nullptr;
+      // Button still pressed - check duration
+      int64_t pressStart = g_btnSelectPressStart;
+      delay(1000);  // Wait for potential long press
+      
+      if (digitalRead(BTN_SELECT) == LOW) {
+        // LONG PRESS (held for 1+ second)
+        g_btnSelectPending.store(false, std::memory_order_relaxed);
+        
+        if (g_appState == STATE_READ) {
+          Serial.println("[Button] SELECT long press - forcing full refresh");
+          g_forceFullRefresh.store(true, std::memory_order_relaxed);
+          
+          // Re-display current page with full refresh
+          xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+          showSlot(g_role[CUR]);
+          xSemaphoreGive(g_sdMutex);
         }
-        g_appState = STATE_BOOK_SELECT;
-        showMenu();
+        
+        // Wait for button release
+        while (digitalRead(BTN_SELECT) == LOW) delay(10);
+      } else {
+        // SHORT PRESS (released within 1 second)
+        g_btnSelectPending.store(false, std::memory_order_relaxed);
+        
+        if (g_appState == STATE_BOOK_SELECT) {
+          startBook(g_selectedBookIdx);
+        } else if (g_appState == STATE_READ) {
+          // Return to menu
+          if (g_displayTaskHandle) {
+            vTaskDelete(g_displayTaskHandle);
+            g_displayTaskHandle = nullptr;
+          }
+          g_appState = STATE_BOOK_SELECT;
+          showMenu();
+        }
       }
+    } else {
+      // Button already released
+      g_btnSelectPending.store(false, std::memory_order_relaxed);
     }
   }
 
