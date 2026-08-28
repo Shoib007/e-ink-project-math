@@ -75,6 +75,12 @@ private:
   // checkPageOverflow() so we never call selectFont() mid-draw.
   int16_t _bodyFontAscent = 12;   // sensible default until beginPage() runs
 
+  // ---- Font metrics cache (computed once per page in beginPage()) ----------
+  // Indexed by FontLevel.  Avoids repeated getTextBounds() calls per word.
+  struct FontMetrics { int16_t ascent; int16_t descent; int16_t lineAdv; };
+  FontMetrics _fontMetrics[6] = {};
+  FontLevel   _curFontLevel   = static_cast<FontLevel>(-1);  // tracks active font
+
   // Wrap bounds — changed for list items and table cells
   int16_t _wrapLeftMargin = MARGIN_LEFT;
   int16_t _rightBound     = DISPLAY_W - MARGIN_RIGHT;
@@ -100,6 +106,7 @@ private:
 
   // ---- Private helpers ----------------------------------------------------
   int16_t fontAscent(FontLevel level);
+  void    cacheAllFontMetrics();
   void    selectFont(FontLevel level);
   void    newLine(int16_t extraSpacing = 0);
   void    signalPageFull();

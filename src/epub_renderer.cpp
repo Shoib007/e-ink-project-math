@@ -10,6 +10,36 @@ extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 EpubRenderer* EpubRenderer::s_instance = nullptr;
 
 // ===========================================================================
+// RGB565 → luma lookup table (64 KB in PSRAM)
+//
+// Precomputes the luma value for every possible 16-bit RGB565 pixel.
+// Index = the 16-bit pixel value; value = 0-255 luma.
+// Threshold for black/white is 180 (matching the original code).
+// ===========================================================================
+static uint8_t* s_lumaLUT = nullptr;
+
+static void ensureLumaLUT() {
+  if (s_lumaLUT) return;
+  s_lumaLUT = static_cast<uint8_t*>(
+    heap_caps_malloc(65536, MALLOC_CAP_SPIRAM));
+  if (!s_lumaLUT) return;
+  for (uint32_t i = 0; i < 65536; ++i) {
+    uint8_t r8 = static_cast<uint8_t>(((i >> 11) & 0x1F) << 3);
+    uint8_t g8 = static_cast<uint8_t>(((i >>  5) & 0x3F) << 2);
+    uint8_t b8 = static_cast<uint8_t>(( i        & 0x1F) << 3);
+    uint32_t lum = (static_cast<uint32_t>(r8) * 299 +
+                    static_cast<uint32_t>(g8) * 587 +
+                    static_cast<uint32_t>(b8) * 114) / 1000;
+    s_lumaLUT[i] = static_cast<uint8_t>(lum);
+  }
+}
+
+// Fast luma lookup: returns black(0) or white(1) for a 16-bit RGB565 pixel.
+static inline uint8_t lumaBW(uint16_t pixel) {
+  return (s_lumaLUT && s_lumaLUT[pixel] < 180) ? 0 : 1;
+}
+
+// ===========================================================================
 // PNG I/O callbacks (file-level statics; decodes are serial on Core 1)
 // ===========================================================================
 static File s_pngFile;
@@ -33,11 +63,12 @@ int EpubRenderer::s_pngDraw(PNGDRAW* pDraw) {
 }
 
 void EpubRenderer::pngRowDraw(PNGDRAW* pDraw) {
+  ensureLumaLUT();
   uint16_t* buf = _lineBuffer;
   bool dynamicBuf = false;
   if (pDraw->iWidth > DISPLAY_W) {
     buf = static_cast<uint16_t*>(heap_caps_malloc(pDraw->iWidth * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (!buf) return; // If allocation fails, skip this row to avoid crash
+    if (!buf) return;
     dynamicBuf = true;
   }
 
@@ -48,15 +79,7 @@ void EpubRenderer::pngRowDraw(PNGDRAW* pDraw) {
     for (int x = 0; x < maxCols; ++x) {
       int16_t px = _imgDestX + static_cast<int16_t>(x);
       if (px < 0 || px >= DISPLAY_W) continue;
-      uint16_t p  = buf[x];
-      uint8_t  r8 = static_cast<uint8_t>(((p >> 11) & 0x1F) << 3);
-      uint8_t  g8 = static_cast<uint8_t>(((p >>  5) & 0x3F) << 2);
-      uint8_t  b8 = static_cast<uint8_t>(( p        & 0x1F) << 3);
-      uint16_t luma = static_cast<uint16_t>(
-        (static_cast<uint32_t>(r8) * 299 +
-         static_cast<uint32_t>(g8) * 587 +
-         static_cast<uint32_t>(b8) * 114) / 1000);
-      g_pool.drawPixel(px, py, luma < 180 ? 0 : 1);
+      g_pool.drawPixel(px, py, lumaBW(buf[x]));
     }
   }
 
@@ -75,6 +98,7 @@ bool EpubRenderer::s_jpgDraw(int16_t x, int16_t y,
                                uint16_t w, uint16_t h, uint16_t* bitmap) {
   if (!s_instance || !bitmap) return false;
   EpubRenderer& inst = *s_instance;
+  ensureLumaLUT();
 
   // Track extent relative to the dest origin
   uint16_t relW = static_cast<uint16_t>(x - inst._imgDestX) + w;
@@ -82,24 +106,16 @@ bool EpubRenderer::s_jpgDraw(int16_t x, int16_t y,
   if (relW > inst._jpgImgW) inst._jpgImgW = relW;
   if (relH > inst._jpgImgH) inst._jpgImgH = relH;
 
-  // Render pixels
+  // Render pixels using LUT
   for (uint16_t row = 0; row < h; ++row) {
     for (uint16_t col = 0; col < w; ++col) {
       int16_t px = x + static_cast<int16_t>(col);
       int16_t py = y + static_cast<int16_t>(row);
       if (px < 0 || px >= DISPLAY_W || py < 0 || py >= DISPLAY_H) continue;
-      uint16_t p  = bitmap[row * w + col];
-      uint8_t  r8 = static_cast<uint8_t>(((p >> 11) & 0x1F) << 3);
-      uint8_t  g8 = static_cast<uint8_t>(((p >>  5) & 0x3F) << 2);
-      uint8_t  b8 = static_cast<uint8_t>(( p        & 0x1F) << 3);
-      uint16_t luma = static_cast<uint16_t>(
-        (static_cast<uint32_t>(r8) * 299 +
-         static_cast<uint32_t>(g8) * 587 +
-         static_cast<uint32_t>(b8) * 114) / 1000);
-      g_pool.drawPixel(px, py, luma < 180 ? 0 : 1);
+      g_pool.drawPixel(px, py, lumaBW(bitmap[row * w + col]));
     }
   }
-  return true;  // continue decoding
+  return true;
 }
 
 // ===========================================================================
@@ -169,8 +185,12 @@ bool EpubRenderer::decodeJpg(const char* path,
 
 // ===========================================================================
 // Font selection — maps FontLevel to the correct GFX font object
+// Skips the call if the font is already active (avoids hundreds of redundant
+// setFont() calls per page for text-heavy content).
 // ===========================================================================
 void EpubRenderer::selectFont(FontLevel level) {
+  if (level == _curFontLevel) return;
+  _curFontLevel = level;
   switch (level) {
     case FONT_H1:        _canvas.setFont(&FreeSansBold18pt7b);       break;
     case FONT_H2:        _canvas.setFont(&FreeSansBold12pt7b);       break;
@@ -182,12 +202,31 @@ void EpubRenderer::selectFont(FontLevel level) {
 }
 
 // ===========================================================================
+// Font metrics cache — compute ascent/descent/lineAdv for all font levels
+// once per page.  Avoids repeated getTextBounds() in renderWord().
+// ===========================================================================
+void EpubRenderer::cacheAllFontMetrics() {
+  for (int i = 0; i <= FONT_H1; ++i) {
+    FontLevel lvl = static_cast<FontLevel>(i);
+    _curFontLevel = static_cast<FontLevel>(-1);  // force selectFont to apply
+    selectFont(lvl);
+    int16_t x1, y1; uint16_t bw, bh;
+    _canvas.getTextBounds("Ag", 0, 0, &x1, &y1, &bw, &bh);
+    _fontMetrics[i].ascent  = static_cast<int16_t>(-y1);
+    _fontMetrics[i].descent = static_cast<int16_t>(bh) + y1;
+    _fontMetrics[i].lineAdv = static_cast<int16_t>(bh);
+  }
+  _curFontLevel = static_cast<FontLevel>(-1);  // reset so first selectFont works
+}
+
+// ===========================================================================
 // Page management
 // ===========================================================================
 
 // Helper: measure the ascent of the body font so we can prime _cy correctly.
 // Ascent = distance from baseline to top of tallest glyph = -y1 from getTextBounds.
 int16_t EpubRenderer::fontAscent(FontLevel level) {
+  if (_fontMetrics[level].ascent != 0) return _fontMetrics[level].ascent;
   selectFont(level);
   int16_t x1, y1; uint16_t bw, bh;
   _canvas.getTextBounds("Ag", 0, 0, &x1, &y1, &bw, &bh);
@@ -198,12 +237,12 @@ void EpubRenderer::beginPage(int slot) {
   g_pool.setCurrent(slot);
   g_pool.clearCurrent();
 
-  // Compute and CACHE the body-font ascent once per page.
-  // This is used both to prime _cy and in checkPageOverflow().
-  // We must NOT call fontAscent() again during rendering because it calls
-  // selectFont(), which would silently reset the active canvas font and cause
-  // every heading to render in the body font size.
-  _bodyFontAscent = fontAscent(FONT_BODY);
+  // Pre-compute ascent/descent for ALL font levels once per page.
+  // This eliminates thousands of getTextBounds() calls during rendering.
+  cacheAllFontMetrics();
+
+  // _bodyFontAscent is the cached FONT_BODY ascent from the metrics table.
+  _bodyFontAscent = _fontMetrics[FONT_BODY].ascent;
 
   // _cy is the BASELINE of the first text line.
   // Prime it so the top of the tallest body glyph sits at MARGIN_TOP.
@@ -266,20 +305,65 @@ void EpubRenderer::checkPageOverflow(int16_t neededH) {
 
 // ===========================================================================
 // Drawing helpers — 1-px horizontal and vertical lines
+//
+// Operate directly on the current slot's framebuffer for batch speed.
+// H-line: set/clear full bytes with memset, handle edge pixels with masks.
+// V-line: stride by FB_STRIDE per row, set/clear single bits.
 // ===========================================================================
 void EpubRenderer::drawHLine(int16_t x, int16_t y, int16_t w) {
-  if (y < 0 || y >= DISPLAY_H) return;
-  for (int16_t px = x; px < x + w; ++px) {
-    if (px < 0 || px >= DISPLAY_W) continue;
-    g_pool.drawPixel(px, y, 0);  // 0 = black
+  if (y < 0 || y >= DISPLAY_H || w <= 0) return;
+  // Clamp to display bounds
+  if (x < 0) { w += x; x = 0; }
+  if (x + w > DISPLAY_W) w = DISPLAY_W - x;
+  if (w <= 0) return;
+
+  uint8_t* row = const_cast<uint8_t*>(g_pool.slotBuf(g_pool.currentSlot())) + y * FB_STRIDE;
+
+  int startByte = x >> 3;
+  int startBit  = x & 7;
+  int endBit    = (x + w) & 7;
+  int endByte   = (x + w - 1) >> 3;
+
+  if (startByte == endByte) {
+    // All pixels within one byte
+    uint8_t mask = 0;
+    for (int i = 0; i < w; ++i) mask |= (0x80u >> (startBit + i));
+    row[startByte] &= ~mask;  // set black
+    return;
+  }
+
+  // First partial byte
+  if (startBit > 0) {
+    uint8_t mask = 0xFFu >> startBit;  // bits from startBit to bit 7
+    row[startByte] &= ~mask;
+    startByte++;
+  }
+
+  // Full middle bytes — clear to black (0x00)
+  if (startByte <= endByte) {
+    memset(row + startByte, 0x00, endByte - startByte);
+  }
+
+  // Last partial byte
+  if (endBit > 0 && endByte >= startByte) {
+    uint8_t mask = ~(0xFFu >> endBit);  // bits from bit 7 down to endBit
+    row[endByte] &= ~mask;
   }
 }
 
 void EpubRenderer::drawVLine(int16_t x, int16_t y, int16_t h) {
-  if (x < 0 || x >= DISPLAY_W) return;
-  for (int16_t py = y; py < y + h; ++py) {
-    if (py < 0 || py >= DISPLAY_H) continue;
-    g_pool.drawPixel(x, py, 0);  // 0 = black
+  if (x < 0 || x >= DISPLAY_W || h <= 0) return;
+  if (y < 0) { h += y; y = 0; }
+  if (y + h > DISPLAY_H) h = DISPLAY_H - y;
+  if (h <= 0) return;
+
+  const uint8_t bitMask = 0x80u >> (x & 7);
+  const int     byteOff = x >> 3;
+  uint8_t* base = const_cast<uint8_t*>(g_pool.slotBuf(g_pool.currentSlot())) + y * FB_STRIDE + byteOff;
+
+  for (int16_t i = 0; i < h; ++i) {
+    *base &= ~bitMask;  // set black
+    base += FB_STRIDE;
   }
 }
 
@@ -297,23 +381,23 @@ void EpubRenderer::renderWord(const char* word, FontLevel level) {
   selectFont(level);
   _canvas.setTextWrap(false);
 
-  // Measure with y=0 to get purely font-relative offsets
+  // Use cached ascent/descent (computed once per page in beginPage()).
+  // Only call getTextBounds() for the pixel width (advance) — we can't
+  // cache that per-word, but we avoid the redundant ascent/descent work.
   int16_t x1, y1; uint16_t tw, th;
   _canvas.getTextBounds(word, 0, 0, &x1, &y1, &tw, &th);
 
-  // ascent = pixels above baseline; descent = pixels below baseline
-  int16_t ascent  = static_cast<int16_t>(-y1);          // y1 is negative
-  int16_t descent = static_cast<int16_t>(th) + y1;      // th - ascent
+  const FontMetrics& fm = _fontMetrics[level];
+  int16_t ascent  = fm.ascent;
+  int16_t descent = fm.descent;
   int16_t advance = static_cast<int16_t>(tw);
 
   // Wrap if word won't fit on this line
   if (_cx > _wrapLeftMargin && _cx + advance > _rightBound) {
     newLine();
     if (_pageFull) return;
-    // Re-measure after wrap (cursor moved)
+    // Re-measure width only after cursor moved (ascent/descent unchanged)
     _canvas.getTextBounds(word, 0, 0, &x1, &y1, &tw, &th);
-    ascent  = static_cast<int16_t>(-y1);
-    descent = static_cast<int16_t>(th) + y1;
     advance = static_cast<int16_t>(tw);
   }
 
@@ -481,27 +565,24 @@ void EpubRenderer::renderBlockImageJpg(const char* path) {
   if (_lineHasContent) newLine();
   if (_pageFull) return;
 
-  // --- Step 1: get native image size at scale=1 ---
+  // --- Step 1: get native image size via SOF marker parse (single SD open) ---
+  // readJpegDimensions() scans JFIF/EXIF markers directly — no full decode.
+  // This replaces the old getSdJpgSize() + fallback approach (2-4 SD opens).
   uint16_t nativeW = 0, nativeH = 0;
-  TJpgDec.setJpgScale(1);
-  if (_sdMutex) xSemaphoreTake(_sdMutex, portMAX_DELAY);
-  JRESULT rc = TJpgDec.getSdJpgSize(&nativeW, &nativeH, path);
-  if (_sdMutex) xSemaphoreGive(_sdMutex);
-
-  Serial.printf("[JPEG] native size rc=%d  w=%u h=%u  path=%s\n",
-                rc, nativeW, nativeH, path);
-
-  if (rc != JDR_OK || nativeW == 0 || nativeH == 0) {
-    Serial.printf("[JPEG] getSdJpgSize failed, trying manual SOF parse\n");
-    if (!readJpegDimensions(path, _sdMutex, nativeW, nativeH)) {
-      Serial.printf("[JPEG] SOF parse also failed – skipping\n");
+  if (!readJpegDimensions(path, _sdMutex, nativeW, nativeH)) {
+    // Fallback: try TJpgDec's size query if SOF parse fails
+    TJpgDec.setJpgScale(1);
+    if (_sdMutex) xSemaphoreTake(_sdMutex, portMAX_DELAY);
+    JRESULT rc = TJpgDec.getSdJpgSize(&nativeW, &nativeH, path);
+    if (_sdMutex) xSemaphoreGive(_sdMutex);
+    if (rc != JDR_OK || nativeW == 0 || nativeH == 0) {
+      Serial.printf("[JPEG] dimension query failed for %s\n", path);
       return;
     }
-    Serial.printf("[JPEG] SOF parse: w=%u h=%u\n", nativeW, nativeH);
   }
+  Serial.printf("[JPEG] native size w=%u h=%u  path=%s\n", nativeW, nativeH, path);
 
   // --- Step 2: pick scale factor to fit inside display width ---
-  // TJpgDec valid scales: 1 (full), 2 (1/2), 4 (1/4), 8 (1/8)
   uint8_t  scale  = 1;
   uint16_t imgW   = nativeW;
   uint16_t imgH   = nativeH;
@@ -513,15 +594,8 @@ void EpubRenderer::renderBlockImageJpg(const char* path) {
   }
   Serial.printf("[JPEG] using scale=%u  rendered w=%u h=%u\n", scale, imgW, imgH);
 
-  // --- Step 3: re-query at chosen scale so TJpgDec internal state is correct ---
+  // --- Step 3: set scale for decode (no second getSdJpgSize — dimensions are exact) ---
   TJpgDec.setJpgScale(scale);
-  if (scale > 1) {
-    uint16_t qW = 0, qH = 0;
-    if (_sdMutex) xSemaphoreTake(_sdMutex, portMAX_DELAY);
-    TJpgDec.getSdJpgSize(&qW, &qH, path);   // primes internal state at this scale
-    if (_sdMutex) xSemaphoreGive(_sdMutex);
-    if (qW > 0) { imgW = qW; imgH = qH; }   // use exact scaled dimensions if available
-  }
 
   // --- Step 4: page overflow check ---
   checkPageOverflow(static_cast<int16_t>(imgH) + LINE_SPACING * 2);
@@ -875,35 +949,57 @@ bool EpubRenderer::feed(const RenderElem& elem) {
 //
 // Our bitmaps are laid out for setRotation(1) (480×800 portrait).
 // writeImage() writes in native landscape (800×480) without GFX rotation.
+//
+// The mapping is: native pixel (nx, ny) = portrait pixel (ny, 799-nx).
+// Byte-level transposition: for each dest byte at (ny, nx_byte), reads 8
+// source bytes (all from row ny, each at a different column) and packs one
+// bit from each into the destination byte.  ~8× fewer iterations than the
+// original per-pixel loop.
+// s_nativeBuf is allocated in internal SRAM (~48 KB) for fast CPU access.
 // ===========================================================================
 static uint8_t* s_nativeBuf = nullptr;
 
 static const uint8_t* portraitToNative(const uint8_t* portrait) {
   if (!portrait) return nullptr;
+
   if (!s_nativeBuf) {
     s_nativeBuf = static_cast<uint8_t*>(
-      heap_caps_aligned_alloc(64, DISPLAY_W * DISPLAY_H / 2, MALLOC_CAP_SPIRAM));
+      heap_caps_aligned_alloc(64, FB_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (!s_nativeBuf) {
-      Serial.println("[Renderer] ERROR: Failed to allocate s_nativeBuf in internal RAM!");
+      // Fallback to PSRAM if internal SRAM is full
+      s_nativeBuf = static_cast<uint8_t*>(
+        heap_caps_aligned_alloc(64, FB_SIZE, MALLOC_CAP_SPIRAM));
+    }
+    if (!s_nativeBuf) {
+      Serial.println("[Renderer] ERROR: Failed to allocate s_nativeBuf!");
       return nullptr;
     }
   }
 
   constexpr int16_t panelW      = GxEPD2_750_T7::WIDTH;   // 800
   constexpr int16_t panelH      = GxEPD2_750_T7::HEIGHT;  // 480
-  constexpr int     panelStride = (panelW + 7) / 8;
+  constexpr int     panelStride = (panelW + 7) / 8;       // 100
 
   memset(s_nativeBuf, 0xFF, FB_SIZE);
+
   for (int16_t ny = 0; ny < panelH; ++ny) {
-    for (int16_t nx = 0; nx < panelW; ++nx) {
-      const int16_t px      = ny;
-      const int16_t py      = panelW - 1 - nx;
-      const uint8_t srcByte = portrait[py * FB_STRIDE + (px >> 3)];
-      const bool    white   = (srcByte >> (7 - (px & 7))) & 1;
-      uint8_t*      dstByte = &s_nativeBuf[ny * panelStride + (nx >> 3)];
-      const uint8_t mask    = static_cast<uint8_t>(0x80u >> (nx & 7));
-      if (white) *dstByte |=  mask;
-      else       *dstByte &= static_cast<uint8_t>(~mask);
+    uint8_t*      dstRow = s_nativeBuf + ny * panelStride;
+    const int     bp     = ny & 7;            // bit position within source byte
+    const uint8_t bit    = static_cast<uint8_t>(0x80u >> bp);  // mask for this bit
+
+    for (int16_t nxByte = 0; nxByte < panelStride; ++nxByte) {
+      uint8_t dst = 0;
+      const int nxBase = nxByte << 3;
+      for (int k = 0; k < 8; ++k) {
+        const int16_t nx = nxBase + k;
+        if (nx >= panelW) break;
+        // Portrait source: px = ny, py = 799 - nx
+        const int16_t py = panelW - 1 - nx;
+        const uint8_t srcByte = portrait[py * FB_STRIDE + (ny >> 3)];
+        if (srcByte & bit)
+          dst |= static_cast<uint8_t>(0x80u >> k);
+      }
+      dstRow[nxByte] = dst;
     }
   }
   return s_nativeBuf;

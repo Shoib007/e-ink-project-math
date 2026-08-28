@@ -267,16 +267,20 @@ static void displayTask(void* /*param*/) {
         xSemaphoreGive(g_sdMutex);
       }
 
+      // Show the page FIRST (user sees it immediately)
       xSemaphoreTake(g_sdMutex, portMAX_DELAY);
       showSlot(g_role[NEXT]);
       xSemaphoreGive(g_sdMutex);
 
       rotateFwd();
 
-      int newNextPage = g_slotPage[g_role[CUR]] + 1;
-      if (newNextPage < g_totalPages) {
+      // THEN pre-fetch the page TWO steps ahead in background.
+      // This prediction ensures the next NAV_NEXT is instant if the user
+      // pages forward sequentially (99% of use cases).
+      int prefetchPage = g_slotPage[g_role[CUR]] + 1;
+      if (prefetchPage < g_totalPages && prefetchPage != g_slotPage[g_role[NEXT]]) {
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
-        loadSlot(g_role[NEXT], newNextPage);
+        loadSlot(g_role[NEXT], prefetchPage);
         xSemaphoreGive(g_sdMutex);
       }
     } else {
@@ -296,13 +300,14 @@ static void displayTask(void* /*param*/) {
 
       rotateBwd();
 
+      // Show the page first, then pre-fetch two steps back
       g_slotValid[g_role[PREV]] = false;
       g_slotPage [g_role[PREV]] = -1;
 
-      int newPrevPage = g_slotPage[g_role[CUR]] - 1;
-      if (newPrevPage >= 0) {
+      int prefetchPage = g_slotPage[g_role[CUR]] - 1;
+      if (prefetchPage >= 0 && prefetchPage != g_slotPage[g_role[PREV]]) {
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
-        loadSlot(g_role[PREV], newPrevPage);
+        loadSlot(g_role[PREV], prefetchPage);
         xSemaphoreGive(g_sdMutex);
       }
     }
@@ -439,6 +444,56 @@ void IRAM_ATTR onBtnSelect() {
 }
 
 void loop() {
+  // --- Serial command handler (e.g. !CLEARCACHE from Python tool) ---
+  if (Serial.available()) {
+    char cmd[32];
+    int len = Serial.readBytesUntil('\n', cmd, sizeof(cmd) - 1);
+    cmd[len] = '\0';
+    if (strncmp(cmd, "!CLEARCACHE", 11) == 0) {
+      Serial.println("[Cache] Deleting cache...");
+      xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+      // Delete meta.bin for the current book (forces rebuild on next boot)
+      if (g_currentBook) {
+        char metaPath[128];
+        snprintf(metaPath, sizeof(metaPath), "%s/meta.bin", g_currentBook->cacheDir);
+        if (SD.exists(metaPath)) {
+          SD.remove(metaPath);
+          Serial.printf("[Cache] Deleted %s\n", metaPath);
+        }
+        char datPath[128];
+        snprintf(datPath, sizeof(datPath), "%s/pages.dat", g_currentBook->cacheDir);
+        if (SD.exists(datPath)) {
+          SD.remove(datPath);
+          Serial.printf("[Cache] Deleted %s\n", datPath);
+        }
+      } else {
+        Serial.println("[Cache] No book loaded, scanning all cache dirs...");
+        File root = SD.open("/cache");
+        if (root && root.isDirectory()) {
+          File entry;
+          while ((entry = root.openNextFile())) {
+            if (entry.isDirectory()) {
+              char pathBuf[128];
+              const char* name = entry.name();
+              const char* base = strrchr(name, '/');
+              base = (base && *(base + 1)) ? base + 1 : name;
+              snprintf(pathBuf, sizeof(pathBuf), "/cache/%s/meta.bin", base);
+              if (SD.exists(pathBuf)) SD.remove(pathBuf);
+              snprintf(pathBuf, sizeof(pathBuf), "/cache/%s/pages.dat", base);
+              if (SD.exists(pathBuf)) SD.remove(pathBuf);
+            }
+            entry.close();
+          }
+        }
+        Serial.println("[Cache] All cache cleared.");
+      }
+      xSemaphoreGive(g_sdMutex);
+      Serial.println("[Cache] Restarting...");
+      delay(500);
+      ESP.restart();
+    }
+  }
+
   if (g_btnNextPending.load(std::memory_order_relaxed)) {
     g_btnNextPending.store(false, std::memory_order_relaxed);
     if (digitalRead(BTN_NEXT) == LOW) {

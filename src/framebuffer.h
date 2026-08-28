@@ -99,6 +99,9 @@ public:
     return _slots[slot].buf();
   }
 
+  // Return the index of the slot currently targeted by the renderer.
+  int currentSlot() const { return _current; }
+
 private:
   Framebuffer _slots[POOL_SLOTS];
   int         _current = -1;
