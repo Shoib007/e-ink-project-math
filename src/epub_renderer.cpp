@@ -442,6 +442,10 @@ void EpubRenderer::drawVLine(int16_t x, int16_t y, int16_t h) {
 //     y1 < 0  (top of bbox above baseline  = ascent)
 //     h + y1  (below baseline              = descent)
 //   We track _lineH = max over all words of (ascent + descent) = full line advance.
+//
+// Word breaking: if a single word exceeds the available width, it will be
+// drawn on its own line (even if it's the first word) and allowed to overflow.
+// For table cells, measureTableCell() accounts for this in row height.
 // ===========================================================================
 void EpubRenderer::renderWord(const char* word, FontLevel level) {
   if (!word || !word[0]) return;
@@ -459,8 +463,16 @@ void EpubRenderer::renderWord(const char* word, FontLevel level) {
   int16_t descent = fm.descent;
   int16_t advance = static_cast<int16_t>(tw);
 
+  // Available width from current cursor to right bound
+  int16_t availW = _rightBound - _cx;
+  
   // Wrap if word won't fit on this line
-  if (_cx > _wrapLeftMargin && _cx + advance > _rightBound) {
+  // Also wrap if this is the first word on the line but it's too wide
+  // (allow it to overflow on its own line rather than clipping)
+  bool shouldWrap = (_cx > _wrapLeftMargin && _cx + advance > _rightBound) ||
+                    (_cx == _wrapLeftMargin && advance > availW);
+  
+  if (shouldWrap) {
     newLine();
     if (_pageFull) return;
     // Re-measure width only after cursor moved (ascent/descent unchanged)
@@ -716,6 +728,7 @@ void EpubRenderer::renderBlockImageJpg(const char* path) {
 // Simulates word-wrap within colW without drawing anything.
 // Returns the CONTENT height (px) needed; padding is added by TableRenderer.
 // Handles CELL_IMG_SENTINEL-embedded images (estimated height).
+// Supports breaking words that exceed column width.
 // ===========================================================================
 int16_t EpubRenderer::measureTableCell(const char* text,
                                         FontLevel   level,
@@ -732,20 +745,47 @@ int16_t EpubRenderer::measureTableCell(const char* text,
   char        word[64];
   int         wi = 0;
 
-  auto measureWord = [&]() {
+  auto measureWord = [&](int16_t wordW) {
+    if (wordW <= 0) return;
+    int16_t needed = (cx > 0) ? wordW + 4 : wordW;
+    
+    // Handle word wider than column - break it across lines
+    if (wordW > colW) {
+      // Word itself is wider than column: it takes at least one full line
+      // plus additional lines for the overflow
+      int16_t remaining = wordW;
+      if (cx > 0) {
+        // Current line has content, move to next line first
+        ++lineCount;
+        cx = 0;
+      }
+      // First line takes full column width
+      remaining -= colW;
+      lineCount++;
+      // Additional lines for remaining width
+      while (remaining > 0) {
+        remaining -= colW;
+        if (remaining > 0) lineCount++;
+      }
+      cx = 0;  // next word starts fresh
+      return;
+    }
+    
+    if (cx > 0 && cx + needed > colW) { ++lineCount; cx = wordW; }
+    else                               cx += needed;
+  };
+
+  auto flushWord = [&]() {
     if (wi == 0) return;
     word[wi] = '\0'; wi = 0;
     uint16_t tw, th; int16_t x1, y1;
     _canvas.getTextBounds(word, 0, 0, &x1, &y1, &tw, &th);
-    int16_t needed = (cx > 0) ? static_cast<int16_t>(tw) + 4
-                               : static_cast<int16_t>(tw);
-    if (cx > 0 && cx + needed > colW) { ++lineCount; cx = static_cast<int16_t>(tw); }
-    else                               cx += needed;
+    measureWord(static_cast<int16_t>(tw));
   };
 
   while (*p) {
     if (*p == CELL_IMG_SENTINEL) {
-      measureWord();
+      flushWord();
       ++p;
       while (*p && *p != CELL_IMG_SENTINEL) ++p;
       if (*p) ++p;
@@ -756,12 +796,12 @@ int16_t EpubRenderer::measureTableCell(const char* text,
     }
     char c = *p++;
     if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
-      measureWord();
+      flushWord();
     } else {
       if (wi < 63) word[wi++] = c;
     }
   }
-  measureWord();
+  flushWord();
 
   return lineCount * (fontH + LINE_SPACING) + 2;
 }
