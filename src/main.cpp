@@ -331,9 +331,23 @@ static void displayTask(void* /*param*/) {
 // ---------------------------------------------------------------------------
 // Menu rendering
 // ---------------------------------------------------------------------------
-static void showMenu() {
+#define MENU_PARTIAL_REFRESH_MAX 5  // Full refresh after 5 partial menu updates
+static int  g_menuPartialCount = 0;
+
+static void showMenu(bool partial = false) {
   xSemaphoreTake(g_sdMutex, portMAX_DELAY);
-  display.setFullWindow();
+
+  // Boot menu and every boundary use full refresh; navigations use partial
+  // (GxEPD2 paged partial = full-screen fast partial for GD7965 panels).
+  bool doFull = !partial || (g_menuPartialCount >= MENU_PARTIAL_REFRESH_MAX);
+  if (doFull) {
+    display.setFullWindow();
+    g_menuPartialCount = 0;
+  } else {
+    display.setPartialWindow(0, 0, display.width(), display.height());
+    ++g_menuPartialCount;
+  }
+
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
@@ -516,7 +530,7 @@ void loop() {
     if (digitalRead(BTN_NEXT) == LOW) {
       if (g_appState == STATE_BOOK_SELECT) {
         g_selectedBookIdx = (g_selectedBookIdx + 1) % g_numBooks;
-        showMenu();
+        showMenu(true);
       } else if (g_appState == STATE_READ) {
         NavCmd c = NAV_NEXT;
         xQueueSend(g_navQueue, &c, 0);
@@ -530,7 +544,7 @@ void loop() {
     if (digitalRead(BTN_PREV) == LOW) {
       if (g_appState == STATE_BOOK_SELECT) {
         g_selectedBookIdx = (g_selectedBookIdx - 1 + g_numBooks) % g_numBooks;
-        showMenu();
+        showMenu(true);
       } else if (g_appState == STATE_READ) {
         NavCmd c = NAV_PREV;
         xQueueSend(g_navQueue, &c, 0);
@@ -577,7 +591,7 @@ void loop() {
             g_displayTaskHandle = nullptr;
           }
           g_appState = STATE_BOOK_SELECT;
-          showMenu();
+          showMenu(true);
         }
       }
     } else {
