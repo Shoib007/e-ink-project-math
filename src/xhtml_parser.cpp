@@ -28,6 +28,8 @@ bool XhtmlParser::parse(const char* sdPath, const char* basePath,
   _inTable      = false;  _inTHead = false;
   _inCell       = false;  _cellIsHeader = false;
   _cellBuf[0]   = '\0';   _cellBufLen = 0;
+  _paraHasContent = false;
+  _figureDepth    = 0;
 
   _open = true;
   _cb   = cb;
@@ -169,6 +171,8 @@ bool XhtmlParser::readText(char /*stopAt*/) {
       }
     }
     
+    if (wi > 0 && !_inCell) _paraHasContent = true;   // real word flowed
+
     wi       = 0;
     hadSpace = false;
     return emit(e);
@@ -260,6 +264,10 @@ bool XhtmlParser::processTag() {
              (strncasecmp(tagName, "b",      1) == 0 && (tagName[1]=='\0'||tagName[1]==' '))) {
       _inStrong = false;
     }
+    // ---- Figure wrapper ----------------------------------------------------
+    else if (strncasecmp(tagName,"figure",6)==0 && (tagName[6]=='\0'||tagName[6]==' ')) {
+      if (_figureDepth > 0) _figureDepth--;
+    }
     // ---- List item --------------------------------------------------------
     else if (strncasecmp(tagName, "li", 2) == 0 && tagName[2] == '\0') {
       _inLi = false;
@@ -331,6 +339,7 @@ bool XhtmlParser::processTag() {
   // ---- Paragraph ----------------------------------------------------------
   else if (strncasecmp(tagName,"p",1)==0 && (tagName[1]=='\0'||tagName[1]==' ')) {
     _inPara = true; _headingLevel = FONT_BODY;
+    _paraHasContent = false;
   }
   // ---- Line break (self-closing) ------------------------------------------
   else if (strncasecmp(tagName,"br",2)==0 &&
@@ -344,6 +353,10 @@ bool XhtmlParser::processTag() {
            (strncasecmp(tagName,"b",1)==0     && (tagName[1]=='\0'||tagName[1]==' '))) {
     _inStrong = true;
   }
+  // ---- Figure wrapper -----------------------------------------------------
+  else if (strncasecmp(tagName,"figure",6)==0 && (tagName[6]=='\0'||tagName[6]==' ')) {
+    _figureDepth++;
+  }
   // ---- Ordered list -------------------------------------------------------
   else if (strncasecmp(tagName,"ol",2)==0 && (tagName[2]=='\0'||tagName[2]==' ')) {
     _inOl = true;
@@ -356,6 +369,7 @@ bool XhtmlParser::processTag() {
   else if (strncasecmp(tagName,"li",2)==0 && (tagName[2]=='\0'||tagName[2]==' ')) {
     if (_inOl) {
       _inLi = true;
+      _paraHasContent = false;
       RenderElem e; memset(&e, 0, sizeof(e));
       e.type    = ELEM_OL_ITEM_START;
       e.listNum = static_cast<uint8_t>(_olCounter > 255 ? 255 : _olCounter);
@@ -405,16 +419,47 @@ bool XhtmlParser::processTag() {
 
     // Determine element type
     char     classVal[32] = {0};
+    char     styleVal[128] = {0};
     getAttrValue(tag, "class", classVal, sizeof(classVal));
-    bool isMathInline = (strncasecmp(classVal, "math-inline", 11) == 0);
+    getAttrValue(tag, "style", styleVal, sizeof(styleVal));
+    bool isMathInline  = (strncasecmp(classVal, "math-inline", 11) == 0);
+    bool isFigureLike  = (strstr(classVal, "figure") != nullptr ||
+                          strstr(classVal, "fig")    != nullptr ||
+                          _figureDepth > 0);
+    // Source uses an explicit inline style (e.g. style="display:inline")
+    bool inlineStyled  = (strstr(styleVal, "display: inline")  != nullptr ||
+                          strstr(styleVal, "display:inline")   != nullptr ||
+                          strstr(styleVal, "inline-block")     != nullptr ||
+                          strstr(styleVal, "vertical-align")   != nullptr);
 
     ElemType imgType;
     if (_inMjx) {
       // Inside a <mjx-container>: respect display="true" flag
       imgType = _mjxDisplay ? ELEM_IMAGE_BLOCK : ELEM_IMAGE_INLINE;
+    } else if (isFigureLike) {
+      // Explicit figure wrapper / class → block figure
+      const char* ext = strrchr(src, '.');
+      imgType = (ext && (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0))
+                  ? ELEM_IMAGE_BLOCK_JPG : ELEM_IMAGE_BLOCK;
     } else if (isMathInline) {
       // class="math-inline" anywhere outside mjx-container
       imgType = ELEM_IMAGE_INLINE;
+    } else if (_inCell || _inHeading) {
+      // Inside a table cell or heading the image always flows inline
+      imgType = ELEM_IMAGE_INLINE;
+    } else if ((_inPara || _inLi) && _paraHasContent) {
+      // Inside a paragraph/list item: stay on the current line when any
+      // content (text or inline image) already flowed before the image.
+      imgType = ELEM_IMAGE_INLINE;
+    } else if (inlineStyled) {
+      // Explicit inline styling → inline regardless of container
+      imgType = ELEM_IMAGE_INLINE;
+    } else if (_inPara || _inLi) {
+      // Lone image at the start of an empty paragraph/list item gets its
+      // own line (centred in paragraph, left-aligned in a list item).
+      const char* ext = strrchr(src, '.');
+      imgType = (ext && (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0))
+                  ? ELEM_IMAGE_BLOCK_JPG : ELEM_IMAGE_BLOCK;
     } else {
       // Standalone figure: detect JPEG vs PNG by file extension
       const char* ext = strrchr(src, '.');
@@ -422,6 +467,8 @@ bool XhtmlParser::processTag() {
                              strcasecmp(ext, ".jpeg") == 0);
       imgType = isJpeg ? ELEM_IMAGE_BLOCK_JPG : ELEM_IMAGE_BLOCK;
     }
+
+    if (imgType == ELEM_IMAGE_INLINE) _paraHasContent = true;
 
     RenderElem e; memset(&e, 0, sizeof(e));
     e.type = imgType;

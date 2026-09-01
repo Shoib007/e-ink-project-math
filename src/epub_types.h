@@ -18,8 +18,11 @@
 // ---------------------------------------------------------------------------
 #define MARGIN_LEFT     10
 #define MARGIN_RIGHT    10
-#define MARGIN_TOP      10
-#define MARGIN_BOTTOM   10
+// Header/footer are rendered at display time, outside the cached book body.
+#define HEADER_HEIGHT   34
+#define FOOTER_HEIGHT   30
+#define MARGIN_TOP      (HEADER_HEIGHT + 8)
+#define MARGIN_BOTTOM   (FOOTER_HEIGHT + 8)
 #define LINE_SPACING     4   // extra pixels between lines
 #define PARA_SPACING     8   // extra pixels between paragraphs
 #define HEADING_SPACING 12   // extra pixels after headings

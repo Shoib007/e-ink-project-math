@@ -32,7 +32,7 @@
 // ESP32-S3 ROM function for flushing D-cache to physical PSRAM
 extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 
-#define CACHE_MAGIC        0x45504744u   // 'EPGD' — bumped to invalidate old per-file caches
+#define CACHE_MAGIC        0x45504745u   // 'EPGE' — body area changed for header/footer chrome
 
 struct CacheMeta {
   uint32_t magic;

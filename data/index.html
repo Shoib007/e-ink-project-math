@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>EPUB Reader - Upload Books</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#ffffff; --ink:#222; --mut:#777; --acc:#2b6ef2; --ok:#1a9d5a; --err:#d3322b; --line:#e3e6ea; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 -apple-system,"Segoe UI",Roboto,Arial,sans-serif; background:var(--bg); color:var(--ink); }
+  .wrap { max-width:640px; margin:0 auto; padding:18px; }
+  h1 { font-size:22px; margin:4px 0 2px; }
+  .sub { color:var(--mut); font-size:13px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px;
+          margin-bottom:14px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+  .card h2 { font-size:15px; margin:0 0 10px; }
+  label { font-size:13px; color:var(--mut); display:block; margin:0 0 4px; }
+  input[type=text] { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font-size:15px; }
+  .btn { display:flex; align-items:center; justify-content:center; gap:8px; padding:11px 14px; border:0;
+         border-radius:9px; font-size:15px; font-weight:600; cursor:pointer; color:#fff; }
+  .btn.folder { background:var(--acc); }
+  .btn.zip   { background:var(--ok); }
+  .btn:disabled { opacity:.55; cursor:not-allowed; }
+  .row { display:flex; gap:10px; }
+  .row > * { flex:1; }
+  input[type=file] { display:none; }
+  .drop { border:2px dashed var(--line); border-radius:12px; padding:22px; text-align:center;
+          color:var(--mut); font-size:14px; cursor:pointer; transition:border-color .15s, background .15s; }
+  .drop.drag { border-color:var(--acc); background:#eef4ff; color:var(--acc); }
+  #prog { display:none; margin-top:12px; }
+  #prog .stats { font-size:13px; color:var(--mut); margin-bottom:6px; }
+  .bar { height:10px; background:var(--line); border-radius:6px; overflow:hidden; }
+  .bar > div { height:100%; width:0%; background:var(--acc); transition:width .2s; }
+  #msg { display:none; margin-top:12px; padding:10px 12px; border-radius:8px; font-size:14px; }
+  #msg.ok  { background:#e6f7ec; color:var(--ok); }
+  #msg.err { background:#fdeceb; color:var(--err); }
+  .muted { font-size:12px; color:var(--mut); margin-top:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>CTRL+S Book Uploader</h1>
+  <div class="sub">Upload EPUB books to the device SD card. The reader refreshes its menu automatically when done.</div>
+
+  <div class="card">
+    <label for="bookName">Book name (device folder under /books/)</label>
+    <input id="bookName" type="text" placeholder="auto-filled from folder / zip name">
+  </div>
+
+  <div class="card">
+    <h2>Upload a folder</h2>
+    <input id="folderInput" type="file" webkitdirectory directory>
+    <button id="folderBtn" class="btn folder">Choose Folder&hellip;</button>
+    <div class="muted">Advanced: drag &amp; drop a folder or files below. ZIP files dropped are treated as zip uploads.</div>
+  </div>
+
+  <div class="card">
+    <h2>Upload a ZIP</h2>
+    <input id="zipInput" type="file" accept=".zip">
+    <button id="zipBtn" class="btn zip">Choose ZIP&hellip;</button>
+    <div class="muted">Extracted into /books/&lt;zip-name&gt;/ (auto-flattened if all content lives in one top folder).</div>
+  </div>
+
+  <div class="card">
+    <h2>Drag &amp; drop</h2>
+    <div id="drop" class="drop">Drop a folder, a .zip, or book files here</div>
+  </div>
+
+  <div id="prog" class="card">
+    <div class="stats" id="stats">Preparing&hellip;</div>
+    <div class="bar"><div id="fill"></div></div>
+  </div>
+
+  <div id="msg"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var bookNameEl = document.getElementById('bookName');
+  var folderInput = document.getElementById('folderInput');
+  var folderBtn   = document.getElementById('folderBtn');
+  var zipInput    = document.getElementById('zipInput');
+  var zipBtn      = document.getElementById('zipBtn');
+  var drop        = document.getElementById('drop');
+  var prog        = document.getElementById('prog');
+  var fill        = document.getElementById('fill');
+  var stats       = document.getElementById('stats');
+  var msg         = document.getElementById('msg');
+
+  var CONCURRENCY = 3;
+
+  function sanitize(name) {
+    var n = String(name || '').trim().replace(/[\/\\:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim();
+    return n.slice(0, 60);
+  }
+
+  function setNameFromPath(src) {
+    var cur = bookNameEl.value.trim();
+    if (!cur) bookNameEl.value = sanitize(src.split('/')[0]);
+  }
+
+  function showMsg(text, ok) {
+    msg.style.display = 'block';
+    msg.className = ok ? 'ok' : 'err';
+    msg.textContent = text;
+  }
+
+  function clearMsg() { msg.style.display = 'none'; }
+
+  function setBusy(on) {
+    folderBtn.disabled = on;
+    zipBtn.disabled = on;
+    prog.style.display = on ? 'block' : 'none';
+  }
+
+  function setProgress(pct, text) {
+    fill.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + '%';
+    if (text) stats.textContent = text;
+  }
+
+  // Raw body upload (not FormData) — matches the device's streaming handler.
+  function uploadOne(url, headers, file) {
+    return fetch(url, { method: 'POST', headers: headers, body: file });
+  }
+
+  // ---------- queue with limited concurrency ----------
+  function runQueue(items, bookName, totalBytes) {
+    return new Promise(function (resolve) {
+      var idx = 0, done = 0, uploadedBytes = 0, failed = false;
+      function next() {
+        if (failed) return;
+        if (idx >= items.length) { if (done >= items.length) resolve(); return; }
+        var item = items[idx++];
+        setProgress(0, 'Uploading ' + item.rel + ' (' + done + '/' + items.length + ')');
+        uploadOne('/upload/folder', { 'X-Book-Name': bookName, 'X-Rel-Path': item.rel }, item.file)
+          .then(function (r) {
+            if (!r.ok) throw new Error('Server rejected: ' + r.status + (r.status === 500 ? ' (out of space?)' : ''));
+            done++; uploadedBytes += (item.file.size || 0);
+            setProgress(uploadedBytes / totalBytes * 100, 'Uploading ' + item.rel + ' (' + done + '/' + items.length + ')');
+            next();
+          })
+          .catch(function (e) {
+            failed = true;
+            showMsg('Upload failed on "' + item.rel + '": ' + e.message, false);
+            setBusy(false);
+            resolve();
+          });
+      }
+      for (var i = 0; i < CONCURRENCY; i++) next();
+      if (!items.length) resolve();
+    });
+  }
+
+  function afterUpload(bookName) {
+    return uploadOne('/upload/done', { 'X-Book-Name': bookName }, new Blob([]))
+      .then(function () {
+        showMsg('Upload complete. The device is refreshing its "Select Book" menu now.', true);
+        setBusy(false);
+        fill.style.width = '100%';
+      })
+      .catch(function () {
+        showMsg('Upload complete on device, but the final confirm request failed.', true);
+        setBusy(false);
+      });
+  }
+
+  // ---------- folder upload ----------
+  function startFolder(files, prefix) {
+    var bookName = sanitize(bookNameEl.value || prefix);
+    var items = files.map(function (f) {
+      var rel = (f.webkitRelativePath || f.name).replace(/\\/g, '/');
+      if (prefix && rel.indexOf(prefix + '/') === 0) rel = rel.slice(prefix.length + 1);
+      return { file: f, rel: rel };
+    });
+    var total = items.reduce(function (a, it) { return a + (it.file.size || 0); }, 0);
+    clearMsg();
+    setBusy(true);
+    setProgress(0, 'Starting folder upload (' + items.length + ' files)&hellip;');
+    runQueue(items, bookName, total).then(function () {
+      if (msg.className === 'err') return; // failed path already handled
+      afterUpload(bookName);
+    });
+  }
+
+  folderBtn.addEventListener('click', function () {
+    if (folderBtn.disabled) return;
+    folderInput.value = '';
+    folderInput.click();
+  });
+  folderInput.addEventListener('change', function () {
+    var files = Array.prototype.slice.call(folderInput.files || []);
+    if (!files.length) return;
+    var prefix = (files[0].webkitRelativePath || files[0].name).replace(/\\/g, '/').split('/')[0];
+    setNameFromPath(prefix);
+    startFolder(files, prefix);
+  });
+
+  // ---------- zip upload ----------
+  function startZip(file) {
+    var base = file.name.replace(/\.zip$/i, '');
+    var bookName = sanitize(bookNameEl.value || base);
+    clearMsg();
+    setBusy(true);
+    setProgress(0, 'Uploading ' + file.name + ' (' + (file.size / 1024 / 1024).toFixed(2) + ' MB)&hellip;');
+    uploadOne('/upload/zip', { 'X-Book-Name': bookName }, file)
+      .then(function (r) {
+        if (!r.ok) { showMsg('ZIP upload failed: server returned ' + r.status + (r.status === 500 ? ' (too large or corrupt?)' : ''), false); setBusy(false); return; }
+        setProgress(100, 'ZIP uploaded - extracting on device&hellip;');
+        return afterUpload(bookName);
+      })
+      .catch(function (e) {
+        showMsg('ZIP upload failed: ' + e.message, false);
+        setBusy(false);
+      });
+  }
+
+  zipBtn.addEventListener('click', function () {
+    if (zipBtn.disabled) return;
+    zipInput.value = '';
+    zipInput.click();
+  });
+  zipInput.addEventListener('change', function () {
+    var files = Array.prototype.slice.call(zipInput.files || []);
+    if (files.length) startZip(files[0]);
+  });
+
+  // ---------- drag & drop ----------
+  drop.addEventListener('dragover', function (e) { e.preventDefault(); drop.classList.add('drag'); });
+  drop.addEventListener('dragleave', function () { drop.classList.remove('drag'); });
+  drop.addEventListener('click', function () { zipInput.click(); });
+
+  function walkEntry(entry, path, sink, onDone) {
+    if (entry.isFile) {
+      entry.file(function (f) {
+        f._rel = path + entry.name;
+        sink(f);
+        onDone();
+      }, onDone);
+    } else if (entry.isDirectory) {
+      var reader = entry.createReader();
+      var pending = 1;
+      var maybeDone = function () { if (--pending === 0) onDone(); };
+      var read = function () {
+        reader.readEntries(function (entries) {
+          if (!entries.length) { maybeDone(); return; }
+          entries.forEach(function (e) { pending++; walkEntry(e, path + entry.name + '/', sink, maybeDone); });
+          read();
+        }, maybeDone);
+      };
+      read();
+    } else onDone();
+  }
+
+  drop.addEventListener('drop', function (e) {
+    e.preventDefault();
+    drop.classList.remove('drag');
+    var items = Array.prototype.slice.call(e.dataTransfer.items || []);
+    var entries = [];
+    var realFiles = Array.prototype.slice.call(e.dataTransfer.files || []);
+    items.forEach(function (it) {
+      var en = it.webkitGetAsEntry && it.webkitGetAsEntry();
+      if (en) entries.push(en);
+    });
+
+    // Prefer directory walk if a folder is dropped
+    if (entries.some(function (e) { return e.isDirectory; })) {
+      var collected = [];
+      var directories = entries.filter(function (e) { return e.isDirectory; });
+      var fileEntries = entries.filter(function (e) { return e.isFile; });
+      var pending = 0, walked = 0;
+      var walkDone = function () {
+        walked++;
+        if (walked < pending) return;
+        var prefix = dirTopName;
+        startFolder(collected, prefix);
+      };
+      var dirTopName = directories[0].name;
+      directories.forEach(function (d) { pending++; walkEntry(d, '', fileSink, walkDone); });
+      var fileSink = function (f) { collected.push(f); };
+      // also handle dropped plain files (non-dir)
+      realFiles.forEach(function (f) {
+        if (!f.webkitRelativePath) f.webkitRelativePath = f.name;
+        if (!entries.length || entries.length === realFiles.length) {
+          if (entries.length) {}
+        }
+      });
+      if (!pending) showMsg('No folders found in drop.', false);
+      return;
+    }
+
+    // Plain files: single zip -> zip upload; otherwise folder-style with flat names
+    var files = realFiles;
+    if (!files.length) return;
+    var oneZip = files.length === 1 && /\.zip$/i.test(files[0].name);
+    if (oneZip) { startZip(files[0]); return; }
+    var top = files[0].name;
+    setNameFromPath(top);
+    files.forEach(function (f) { if (!f.webkitRelativePath) f.webkitRelativePath = f.name; });
+    startFolder(files, null);
+  });
+})();
+</script>
+</body>
+</html>

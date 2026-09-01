@@ -7,7 +7,9 @@
 #include <freertos/semphr.h>
 #include <freertos/queue.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 #include <atomic>
+#include <time.h>
 
 #include "epub_types.h"
 #include "framebuffer.h"
@@ -15,6 +17,8 @@
 #include "epub_renderer.h"
 #include "page_cache.h"
 #include "book_scanner.h"
+#include "web_globals.h"
+#include "web_server.h"
 
 // ---------------------------------------------------------------------------
 // Pins
@@ -67,6 +71,17 @@ static int  g_slotPage[3]  = {-1, -1, -1};
 static bool g_slotValid[3] = {false, false, false};
 
 static int  g_totalPages   = 0;
+
+static void formatHeaderDateTime(char* out, size_t outSize) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    snprintf(out, outSize, "Time unavailable");
+    return;
+  }
+  struct tm localTime;
+  localtime_r(&now, &localTime);
+  strftime(out, outSize, "%d %b %Y  %I:%M %p", &localTime);
+}
 
 // Manual full refresh trigger
 static std::atomic<bool> g_forceFullRefresh{false};
@@ -131,6 +146,12 @@ static void cacheBuildTask(void* /*param*/) {
 
       renderer.endPage();
 
+      // ---- DIAG (temporary): per-page heap / stack / integrity check ----
+      Serial.printf("[C1] p%u free=%u swh=%u\n", pageNum,
+                    ESP.getFreeHeap(), uxTaskGetStackHighWaterMark(nullptr));
+      heap_caps_check_integrity_all(true);
+      // -------------------------------------------------------------------
+
       xSemaphoreTake(g_sdMutex, portMAX_DELAY);
       writer.writePage(pageNum, g_pool.slotBuf(slotIdx));
       xSemaphoreGive(g_sdMutex);
@@ -171,13 +192,17 @@ static int  g_partialCount  = 0;
 
 static void showSlot(int slot) {
   if (!g_pool.slotBuf(slot)) return;
+  char dateTime[32];
+  formatHeaderDateTime(dateTime, sizeof(dateTime));
+  int pageNumber = g_slotPage[slot] + 1;
+  const char* bookName = g_currentBook ? g_currentBook->name : "";
   
   // Force full refresh if requested (e.g., user held SELECT button)
   bool forceFullRequested = g_forceFullRefresh.load(std::memory_order_relaxed);
   if (forceFullRequested) {
     g_forceFullRefresh.store(false, std::memory_order_relaxed);
     g_partialCount = 0;
-    renderer.showPageFull(slot);
+    renderer.showPageFull(slot, bookName, dateTime, pageNumber, g_totalPages);
     Serial.println("[Display] Manual full refresh triggered.");
     return;
   }
@@ -186,10 +211,10 @@ static void showSlot(int slot) {
   if (doFull) {
     g_firstShow    = false;
     g_partialCount = 0;
-    renderer.showPageFull(slot);
+    renderer.showPageFull(slot, bookName, dateTime, pageNumber, g_totalPages);
   } else {
     ++g_partialCount;
-    renderer.showPagePartial(slot);
+    renderer.showPagePartial(slot, bookName, dateTime, pageNumber, g_totalPages);
   }
 }
 
@@ -440,9 +465,9 @@ static void startBook(int idx) {
 // ---------------------------------------------------------------------------
 // Buttons & loop
 // ---------------------------------------------------------------------------
-static std::atomic<bool> g_btnNextPending{false};
-static std::atomic<bool> g_btnPrevPending{false};
 static std::atomic<bool> g_btnSelectPending{false};
+static std::atomic<int>  g_btnNextCount{0};
+static std::atomic<int>  g_btnPrevCount{0};
 
 static volatile int64_t  g_btnNextTime = 0;
 static volatile int64_t  g_btnPrevTime = 0;
@@ -455,14 +480,14 @@ void IRAM_ATTR onBtnNext() {
   int64_t now = esp_timer_get_time();
   if (now - g_btnNextTime >= DEBOUNCE_US) {
     g_btnNextTime = now;
-    g_btnNextPending.store(true, std::memory_order_relaxed);
+    g_btnNextCount.fetch_add(1, std::memory_order_relaxed);
   }
 }
 void IRAM_ATTR onBtnPrev() {
   int64_t now = esp_timer_get_time();
   if (now - g_btnPrevTime >= DEBOUNCE_US) {
     g_btnPrevTime = now;
-    g_btnPrevPending.store(true, std::memory_order_relaxed);
+    g_btnPrevCount.fetch_add(1, std::memory_order_relaxed);
   }
 }
 void IRAM_ATTR onBtnSelect() {
@@ -525,30 +550,51 @@ void loop() {
     }
   }
 
-  if (g_btnNextPending.load(std::memory_order_relaxed)) {
-    g_btnNextPending.store(false, std::memory_order_relaxed);
-    if (digitalRead(BTN_NEXT) == LOW) {
-      if (g_appState == STATE_BOOK_SELECT) {
-        g_selectedBookIdx = (g_selectedBookIdx + 1) % g_numBooks;
-        showMenu(true);
-      } else if (g_appState == STATE_READ) {
-        NavCmd c = NAV_NEXT;
-        xQueueSend(g_navQueue, &c, 0);
-      }
+  // --- Web upload finished: rescan /books/ and redraw the menu ---
+  if (g_reloadBooksRequested.load(std::memory_order_relaxed) &&
+      g_appState == STATE_BOOK_SELECT) {
+    g_reloadBooksRequested.store(false, std::memory_order_relaxed);
+    Serial.println("[Menu] Rescanning books after upload...");
+    int n = 0;
+    xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+    n = BookScanner::scan(g_books, MAX_BOOKS);
+    xSemaphoreGive(g_sdMutex);
+    g_numBooks = n;
+    if (g_numBooks > 0) {
+      if (g_selectedBookIdx >= g_numBooks)
+        g_selectedBookIdx = g_numBooks - 1;
+      showMenu();   // full refresh so the new book list is drawn crisply
+    } else {
+      Serial.println("[Menu] Warning: no books found after upload.");
     }
   }
 
-  // Handle PREV button
-  if (g_btnPrevPending.load(std::memory_order_relaxed)) {
-    g_btnPrevPending.store(false, std::memory_order_relaxed);
-    if (digitalRead(BTN_PREV) == LOW) {
-      if (g_appState == STATE_BOOK_SELECT) {
-        g_selectedBookIdx = (g_selectedBookIdx - 1 + g_numBooks) % g_numBooks;
+  // NEXT: consume every click since last drain. In the menu, coalesce them
+  // into a single jump so rapid taps land on the Nth book in one refresh.
+  int nextClicks = g_btnNextCount.exchange(0, std::memory_order_relaxed);
+  if (nextClicks > 0) {
+    if (g_appState == STATE_BOOK_SELECT) {
+      if (g_numBooks > 0) {
+        g_selectedBookIdx = (g_selectedBookIdx + nextClicks) % g_numBooks;
         showMenu(true);
-      } else if (g_appState == STATE_READ) {
-        NavCmd c = NAV_PREV;
-        xQueueSend(g_navQueue, &c, 0);
       }
+    } else if (g_appState == STATE_READ) {
+      NavCmd c = NAV_NEXT;
+      xQueueSend(g_navQueue, &c, 0);
+    }
+  }
+
+  // PREV button
+  int prevClicks = g_btnPrevCount.exchange(0, std::memory_order_relaxed);
+  if (prevClicks > 0) {
+    if (g_appState == STATE_BOOK_SELECT) {
+      if (g_numBooks > 0) {
+        g_selectedBookIdx = (g_selectedBookIdx - prevClicks + g_numBooks) % g_numBooks;
+        showMenu(true);
+      }
+    } else if (g_appState == STATE_READ) {
+      NavCmd c = NAV_PREV;
+      xQueueSend(g_navQueue, &c, 0);
     }
   }
 
@@ -642,6 +688,9 @@ void setup() {
     return;
   }
   renderer.setSdMutex(g_sdMutex);
+
+  // Start the upload web server (WiFi STA, SoftAP fallback) on its own task.
+  webSetup();
 
   // Discover books
   g_numBooks = BookScanner::scan(g_books, MAX_BOOKS);

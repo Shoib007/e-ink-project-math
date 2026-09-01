@@ -50,6 +50,11 @@ private:
   FontLevel _headingLevel = FONT_BODY;
   bool      _inStrong     = false;   // inside <strong> or <b>
 
+  // ---- Image classification context ---------------------------------------
+  bool      _paraHasContent = false; // text or inline image already flowed
+                                    // since current <p>/<li> opened
+  int       _figureDepth    = 0;     // >0 while inside <figure>
+
   // ---- Ordered-list context -----------------------------------------------
   bool      _inOl         = false;
   int       _olCounter    = 1;       // next list-item number (respects start="N")

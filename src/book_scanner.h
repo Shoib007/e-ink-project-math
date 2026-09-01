@@ -25,7 +25,7 @@
 #include <SD.h>
 
 #define BOOKS_ROOT       "/books"
-#define MAX_BOOKS        8
+#define MAX_BOOKS        16
 #define MAX_XHTML_FILES  24
 
 struct BookInfo {
@@ -65,6 +65,7 @@ public:
       // Detect OEBPS/ or EPUB/ subdirectory
       char subPath[80];
       bool found = false;
+      bool rootContent = false;   // content.opf / xhtml live directly in the book dir
       const char* subs[] = {"OEBPS", "EPUB"};
       for (int s = 0; s < 2 && !found; s++) {
         snprintf(subPath, sizeof(subPath), "%s/%s/%s", BOOKS_ROOT, baseName, subs[s]);
@@ -72,13 +73,52 @@ public:
         if (d && d.isDirectory()) found = true;
         if (d) d.close();
       }
-      if (!found) { entry.close(); continue; }
+      if (!found) {
+        // Fallback: some EPUB exports have the content at the book root
+        // (no OEBPS/EPUB wrapper), e.g. /books/<name>/content.opf.
+        char rootPath[96];
+        snprintf(rootPath, sizeof(rootPath), "%s/%s/content.opf", BOOKS_ROOT, baseName);
+        if (SD.exists(rootPath)) {
+          found = true;
+          rootContent = true;
+        } else {
+          char bookDir[72];
+          snprintf(bookDir, sizeof(bookDir), "%s/%s", BOOKS_ROOT, baseName);
+          File probe = SD.open(bookDir);
+          if (probe && probe.isDirectory()) {
+            File e;
+            while ((e = probe.openNextFile())) {
+              if (!e.isDirectory()) {
+                const char* fn = e.name();
+                const char* fb = strrchr(fn, '/');
+                fb = (fb && *(fb + 1)) ? fb + 1 : fn;
+                int nl = strlen(fb);
+                if ((nl > 6 && strcmp(fb + nl - 6, ".xhtml") == 0) ||
+                    (nl > 5 && strcmp(fb + nl - 5, ".html") == 0)) {
+                  rootContent = true;
+                }
+              }
+              e.close();
+              if (rootContent) break;
+            }
+            probe.close();
+            found = rootContent;
+          }
+        }
+      }
+      if (!found) {
+        Serial.printf("[BookScan] Skipping '%s': no OEBPS/EPUB subfolder and no root content\n", baseName);
+        entry.close(); continue;
+      }
 
       BookInfo& b = books[count];
       strncpy(b.name, baseName, sizeof(b.name) - 1);
       b.name[sizeof(b.name) - 1] = '\0';
-      // basePath = subPath + trailing slash
-      snprintf(b.basePath, sizeof(b.basePath), "%s/", subPath);
+      // basePath = content dir + trailing slash
+      if (rootContent)
+        snprintf(b.basePath, sizeof(b.basePath), "%s/%s/", BOOKS_ROOT, baseName);
+      else
+        snprintf(b.basePath, sizeof(b.basePath), "%s/", subPath);
       snprintf(b.cacheDir, sizeof(b.cacheDir), "/cache/%s", baseName);
       b.xhtmlCount = 0;
 
@@ -100,6 +140,10 @@ public:
     }
     root.close();
     Serial.printf("[BookScan] Total books found: %d\n", count);
+    for (int i = 0; i < count; i++) {
+      Serial.printf("[BookScan]   %d. '%s' base='%s' (%d xhtml)\n",
+                    i + 1, books[i].name, books[i].basePath, books[i].xhtmlCount);
+    }
     return count;
   }
 

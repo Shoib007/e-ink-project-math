@@ -153,6 +153,9 @@ void EpubRenderer::pngRowDraw(PNGDRAW* pDraw) {
   if (dynamicBuf) {
     free(buf);
   }
+
+  // ---- DIAG: heap integrity every 32 rows during decode ----
+  if ((pDraw->y & 31) == 0) heap_caps_check_integrity_all(true);
 }
 
 // ===========================================================================
@@ -208,8 +211,26 @@ bool EpubRenderer::decodePng(const char* path,
   outW = static_cast<uint16_t>(_png.getWidth());
   outH = static_cast<uint16_t>(_png.getHeight());
 
+#if defined(PNG_MAX_BUFFERED_PIXELS)
+  const uint32_t maxPkPx = (PNG_MAX_BUFFERED_PIXELS - 48u) / 8u;
+#else
+  const uint32_t maxPkPx = 320u;
+#endif
+  if (outW > maxPkPx) {
+    Serial.printf("[PNG] WARN: '%s' too wide (%u px > %u) - skipped\n",
+                  path, outW, (unsigned)maxPkPx);
+    _png.close();
+    if (_sdMutex) xSemaphoreGive(_sdMutex);
+    outW = outH = 0;
+    return false;
+  }
+
   if (!measureOnly) {
+    heap_caps_check_integrity_all(true);
+    Serial.println("[PNG] decode begin");
     _png.decode(nullptr, 0);   // fires pngRowDraw() for every row
+    Serial.println("[PNG] decode end");
+    heap_caps_check_integrity_all(true);
   }
   _png.close();
 
@@ -518,19 +539,23 @@ void EpubRenderer::renderInlineImage(const char* path) {
   if (imgW == 0 || imgH == 0) return;
 
   // Calculate target height: match typical body text height (~18px)
-  // This makes formulas integrate naturally with surrounding text
+  // This makes formulas integrate naturally with surrounding text.
+  // MIN_HEIGHT ensures tiny source images remain legible on e-ink.
   const uint16_t TARGET_HEIGHT = 18;
+  const uint16_t MIN_HEIGHT    = 14;
   float scale = 1.0f;
   uint16_t scaledW = imgW;
   uint16_t scaledH = imgH;
-  
+
   if (imgH > TARGET_HEIGHT) {
     scale = static_cast<float>(TARGET_HEIGHT) / static_cast<float>(imgH);
-    scaledW = static_cast<uint16_t>(static_cast<float>(imgW) * scale);
-    scaledH = TARGET_HEIGHT;
-    Serial.printf("[PNG] Scaling inline image from %ux%u to %ux%u (scale=%.2f)\n", 
-                  imgW, imgH, scaledW, scaledH, scale);
+  } else if (imgH < MIN_HEIGHT && imgH > 0) {
+    scale = static_cast<float>(MIN_HEIGHT) / static_cast<float>(imgH);
   }
+  scaledW = static_cast<uint16_t>(static_cast<float>(imgW) * scale);
+  scaledH = static_cast<uint16_t>(static_cast<float>(imgH) * scale);
+  if (scaledW == 0) scaledW = 1;
+  if (scaledH == 0) scaledH = 1;
 
   // Add pre-image space if something is already on this line
   if (_lineHasContent) _cx += INLINE_IMG_SPACE;
@@ -1137,7 +1162,53 @@ static const uint8_t* portraitToNative(const uint8_t* portrait) {
 // ===========================================================================
 // showPageFull — full refresh for first page (initialises both GD7965 buffers)
 // ===========================================================================
-void EpubRenderer::showPageFull(int slot) {
+void EpubRenderer::drawPageChrome(int slot, const char* bookName, const char* dateTime,
+                                  int pageNumber, int totalPages) {
+  g_pool.setCurrent(slot);
+  // Slots can be redisplayed without being reloaded from cache; erase the old
+  // dynamic clock and page number before drawing the current values.
+  _canvas.fillRect(0, 0, DISPLAY_W, HEADER_HEIGHT, 1);
+  _canvas.fillRect(0, DISPLAY_H - FOOTER_HEIGHT, DISPLAY_W, FOOTER_HEIGHT, 1);
+  _canvas.setTextColor(0);
+  _canvas.setFont(&FreeSans9pt7b);
+
+  int16_t x1, y1;
+  uint16_t dateW, dateH;
+  _canvas.getTextBounds(dateTime, 0, 0, &x1, &y1, &dateW, &dateH);
+  int16_t dateX = static_cast<int16_t>(DISPLAY_W - MARGIN_RIGHT - dateW);
+  _canvas.setCursor(dateX, 21);
+  _canvas.print(dateTime);
+
+  int16_t maxTitleW = dateX - MARGIN_LEFT - 12;
+  if (maxTitleW < 0) maxTitleW = 0;
+  char title[32];
+  snprintf(title, sizeof(title), "%s", bookName);
+  while (title[0]) {
+    uint16_t titleW, titleH;
+    _canvas.getTextBounds(title, 0, 0, &x1, &y1, &titleW, &titleH);
+    if (titleW <= maxTitleW) break;
+    size_t len = strlen(title);
+    if (len <= 3) { title[0] = '\0'; break; }
+    title[len - 4] = '\0';
+    strcat(title, "...");
+  }
+  _canvas.setCursor(MARGIN_LEFT, 21);
+  _canvas.print(title);
+  drawHLine(MARGIN_LEFT, HEADER_HEIGHT - 2, DISPLAY_W - MARGIN_LEFT - MARGIN_RIGHT);
+
+  char pageText[32];
+  snprintf(pageText, sizeof(pageText), "Page %d / %d", pageNumber, totalPages);
+  uint16_t pageW, pageH;
+  _canvas.getTextBounds(pageText, 0, 0, &x1, &y1, &pageW, &pageH);
+  drawHLine(MARGIN_LEFT, DISPLAY_H - FOOTER_HEIGHT,
+            DISPLAY_W - MARGIN_LEFT - MARGIN_RIGHT);
+  _canvas.setCursor(DISPLAY_W - MARGIN_RIGHT - pageW, DISPLAY_H - 10);
+  _canvas.print(pageText);
+}
+
+void EpubRenderer::showPageFull(int slot, const char* bookName, const char* dateTime,
+                                int pageNumber, int totalPages) {
+  drawPageChrome(slot, bookName, dateTime, pageNumber, totalPages);
   const uint8_t* buf    = g_pool.slotBuf(slot);
   const uint8_t* native = portraitToNative(buf);
   if (!native) return;
@@ -1155,7 +1226,9 @@ void EpubRenderer::showPageFull(int slot) {
 // ===========================================================================
 // showPagePartial — fast partial refresh for all subsequent pages
 // ===========================================================================
-void EpubRenderer::showPagePartial(int slot) {
+void EpubRenderer::showPagePartial(int slot, const char* bookName, const char* dateTime,
+                                   int pageNumber, int totalPages) {
+  drawPageChrome(slot, bookName, dateTime, pageNumber, totalPages);
   const uint8_t* buf    = g_pool.slotBuf(slot);
   const uint8_t* native = portraitToNative(buf);
   if (!native) return;

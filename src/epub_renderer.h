@@ -55,8 +55,10 @@ public:
   void endPage();
 
   // ---- Display side (Core 0) ----------------------------------------------
-  void showPageFull   (int slot);
-  void showPagePartial(int slot);
+  void showPageFull   (int slot, const char* bookName, const char* dateTime,
+                       int pageNumber, int totalPages);
+  void showPagePartial(int slot, const char* bookName, const char* dateTime,
+                       int pageNumber, int totalPages);
 
   // PNG row callback (called from static s_pngDraw → pngRowDraw)
   void pngRowDraw(PNGDRAW* pDraw);
@@ -141,6 +143,8 @@ private:
 
   void    drawHLine(int16_t x, int16_t y, int16_t w);
   void    drawVLine(int16_t x, int16_t y, int16_t h);
+  void    drawPageChrome(int slot, const char* bookName, const char* dateTime,
+                         int pageNumber, int totalPages);
 
   bool    decodePng(const char* path, int16_t destX, int16_t destY,
                     uint16_t& outW, uint16_t& outH, bool measureOnly = false);
