@@ -473,30 +473,55 @@ static volatile int64_t  g_btnNextTime = 0;
 static volatile int64_t  g_btnPrevTime = 0;
 static volatile int64_t  g_btnSelectTime = 0;
 static volatile int64_t  g_btnSelectPressStart = 0;  // Track when SELECT was first pressed
+
+// Switch-debounce state.  Buttons are active-low with internal pull-ups.
+// g_btnNextState / g_btnPrevState track the last de-bounced level (1=released,
+// 0=pressed); a NEW click is counted only after the debounce window has passed
+// AND the button was previously seen released.  This turns one physical press
+// (with its bounce train of FALLING edges) into exactly one counter increment,
+// and requires a release before the next press is accepted.
 #define DEBOUNCE_US 50000LL
 #define LONG_PRESS_US 1000000LL  // 1 second for long press
 
+static uint8_t g_btnNextState  = 1;  // 1 = released (pull-up idle)
+static uint8_t g_btnPrevState  = 1;
+static uint8_t g_btnSelectState = 1;
+
 void IRAM_ATTR onBtnNext() {
-  int64_t now = esp_timer_get_time();
-  if (now - g_btnNextTime >= DEBOUNCE_US) {
-    g_btnNextTime = now;
-    g_btnNextCount.fetch_add(1, std::memory_order_relaxed);
+  int64_t now  = esp_timer_get_time();
+  uint8_t level = (digitalRead(BTN_NEXT) == LOW) ? 0 : 1;
+  if (level == g_btnNextState) return;             // no change → ignore bounce
+  if (level == 0) {                                 // pressed edge
+    // require released state + debounce window before counting a press
+    if (g_btnNextState == 1 && (now - g_btnNextTime) >= DEBOUNCE_US) {
+      g_btnNextTime = now;
+      g_btnNextCount.fetch_add(1, std::memory_order_relaxed);
+    }
   }
+  g_btnNextState = level;
 }
 void IRAM_ATTR onBtnPrev() {
-  int64_t now = esp_timer_get_time();
-  if (now - g_btnPrevTime >= DEBOUNCE_US) {
-    g_btnPrevTime = now;
-    g_btnPrevCount.fetch_add(1, std::memory_order_relaxed);
+  int64_t now  = esp_timer_get_time();
+  uint8_t level = (digitalRead(BTN_PREV) == LOW) ? 0 : 1;
+  if (level == g_btnPrevState) return;             // no change → ignore bounce
+  if (level == 0) {
+    if (g_btnPrevState == 1 && (now - g_btnPrevTime) >= DEBOUNCE_US) {
+      g_btnPrevTime = now;
+      g_btnPrevCount.fetch_add(1, std::memory_order_relaxed);
+    }
   }
+  g_btnPrevState = level;
 }
 void IRAM_ATTR onBtnSelect() {
-  int64_t now = esp_timer_get_time();
-  if (now - g_btnSelectTime >= DEBOUNCE_US) {
+  int64_t now  = esp_timer_get_time();
+  uint8_t level = (digitalRead(BTN_SELECT) == LOW) ? 0 : 1;
+  if (level == g_btnSelectState) return;            // no change → ignore bounce
+  if (level == 0 && g_btnSelectState == 1) {
     g_btnSelectTime = now;
     g_btnSelectPressStart = now;  // Track when button was first pressed
     g_btnSelectPending.store(true, std::memory_order_relaxed);
   }
+  g_btnSelectState = level;
 }
 
 void loop() {
@@ -660,9 +685,9 @@ void setup() {
   pinMode(BTN_NEXT,   INPUT_PULLUP);
   pinMode(BTN_PREV,   INPUT_PULLUP);
   pinMode(BTN_SELECT, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BTN_NEXT), onBtnNext, FALLING);
-  attachInterrupt(digitalPinToInterrupt(BTN_PREV), onBtnPrev, FALLING);
-  attachInterrupt(digitalPinToInterrupt(BTN_SELECT), onBtnSelect, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_NEXT), onBtnNext, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BTN_PREV), onBtnPrev, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BTN_SELECT), onBtnSelect, CHANGE);
 
   display.init(115200);
   display.setRotation(1);
