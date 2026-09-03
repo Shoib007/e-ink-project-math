@@ -8,6 +8,8 @@
 #include <freertos/queue.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
+#include <soc/rtc_cntl_reg.h>
+#include <soc/rtc_cntl_struct.h>
 #include <atomic>
 #include <time.h>
 
@@ -23,14 +25,24 @@
 // ---------------------------------------------------------------------------
 // Pins
 // ---------------------------------------------------------------------------
+// SPI bus (HSPI / SPI2) — shared by EPD + SD
+#define SPI_SCK    12
+#define SPI_MISO   13
+#define SPI_MOSI   11
+
+// E-paper display
 #define EPD_CS     2
-#define EPD_DC     3
+#define EPD_DC     4
 #define EPD_RST    5
 #define EPD_BUSY   6
-#define SD_CS      4
-#define BTN_PREV   44
-#define BTN_NEXT   43
-#define BTN_SELECT  1
+
+// SD card
+#define SD_CS      7
+
+// Buttons
+#define BTN_PREV   8
+#define BTN_NEXT   9
+#define BTN_SELECT 14
 
 // ---------------------------------------------------------------------------
 // Display + renderer
@@ -678,6 +690,7 @@ void loop() {
 // setup()
 // ---------------------------------------------------------------------------
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout detector
   Serial.begin(115200);
   delay(300);
   Serial.printf("\n=== EPUB Reader (Core %d) ===\n", xPortGetCoreID());
@@ -689,10 +702,59 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BTN_PREV), onBtnPrev, CHANGE);
   attachInterrupt(digitalPinToInterrupt(BTN_SELECT), onBtnSelect, CHANGE);
 
-  display.init(115200);
-  display.setRotation(1);
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, -1);
+  delay(100);
+  Serial.printf("[EPD] Pins: CS=%d DC=%d RST=%d BUSY=%d SCK=%d MISO=%d MOSI=%d\n",
+                EPD_CS, EPD_DC, EPD_RST, EPD_BUSY, SPI_SCK, SPI_MISO, SPI_MOSI);
+  Serial.printf("[EPD] BUSY pin reads: %d (expect 0=busy or 1=ready)\n",
+                digitalRead(EPD_BUSY));
+  Serial.printf("[EPD] RST pin reads: %d\n", digitalRead(EPD_RST));
 
-  if (!SD.begin(SD_CS)) {
+  display.init(115200);
+  // GD7965's BUSY output is open-drain: actively HIGH when busy, tri-state (high-Z)
+  // when idle. Without a pull-down the idle line floats HIGH and GxEPD2's busy-wait
+  // loops never exit (10-second Busy Timeout on every _PowerOn/_Update/_PowerOff).
+  // ESP32-S3 internal pull-down (~45 kΩ) holds the idle line LOW so the library
+  // correctly reads LOW=ready. A physical 10 kΩ resistor to GND on the BUSY trace
+  // is the proper hardware fix for production boards.
+  pinMode(EPD_BUSY, INPUT_PULLDOWN);
+
+  // Fixed settling delay — the GD7965 panel on this HAT keeps BUSY HIGH for several
+  // seconds after init (internal waveform loading).  GxEPD2 handles BUSY per-operation
+  // so we just give the panel a moment to finish before touching the SD bus.
+  delay(500);
+  display.setRotation(1);
+  Serial.printf("[EPD] Init complete. BUSY=%d\n", digitalRead(EPD_BUSY));
+
+  // Do NOT hibernate the EPD here — SD.begin() reuses the same SPI bus and
+  // GxEPD2's second display.init() calls SPI.begin() without pin args, which
+  // on ESP32-S3 can remap the SPI peripheral to default GPIOs and break the
+  // data path.  EPD idle draw is negligible (~0µA).
+
+  // Ensure SD card is fully deselected and settled before init.
+  // After a software/power reset the card may retain an active SPI
+  // transaction from the previous boot; explicitly driving CS HIGH
+  // and waiting gives it time to return to a known idle state.
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  delay(200);
+
+  // Re-establish SPI with correct pins before SD init — display.init() calls
+  // SPI.begin() internally and may alter the peripheral state.
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, -1);
+  delay(50);
+
+  bool sdReady = false;
+  for (int attempt = 0; attempt < 5 && !sdReady; attempt++) {
+    sdReady = SD.begin(SD_CS, SPI, 1000000);
+    if (!sdReady) {
+      Serial.printf("[SD] Init attempt %d failed, retrying...\n", attempt + 1);
+      SD.end();
+      SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, -1);
+      delay(500);
+    }
+  }
+  if (!sdReady) {
     showStatus("SD card not found!");
     Serial.println("ERROR: SD init failed");
     return;
@@ -714,17 +776,33 @@ void setup() {
   }
   renderer.setSdMutex(g_sdMutex);
 
-  // Start the upload web server (WiFi STA, SoftAP fallback) on its own task.
-  webSetup();
-
-  // Discover books
+  // Discover books before the display is active (its power-on disturbs the SD bus)
   g_numBooks = BookScanner::scan(g_books, MAX_BOOKS);
   if (g_numBooks <= 0) {
     showStatus("No books found in /books/");
     return;
   }
 
+  // The display is already fully initialized from the first display.init() above.
+  // A second hardware reset confuses the GD7965 controller and leaves BUSY HIGH
+  // permanently, causing _PowerOn() / _Update_Full() busy timeouts.
+  // ESP32-S3 default FSPI pins (MOSI=11, MISO=13, SCK=12) match our custom pins,
+  // so SPI.begin() without args restores the correct mapping after SD.begin().
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, -1);
+  delay(50);
+  display.setRotation(1);
+  Serial.printf("[EPD] SPI re-established. BUSY: %d\n", digitalRead(EPD_BUSY));
+
   g_appState = STATE_BOOK_SELECT;
   g_selectedBookIdx = 0;
+
+  // Draw the menu FIRST, while the EPD is the only active peripheral.
+  // Starting WiFi simultaneously with an EPD full-refresh draws too much
+  // peak current and triggers brownout resets on the N16R8 board.
   showMenu();
+
+  delay(500);  // let EPD settle before WiFi radio starts
+
+  // Start the upload web server (WiFi STA, SoftAP fallback) on its own task.
+  webSetup();
 }
